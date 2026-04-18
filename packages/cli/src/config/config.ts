@@ -12,6 +12,7 @@ import {
   FileDiscoveryService,
   getAllGeminiMdFilenames,
   loadServerHierarchicalMemory,
+  type LoadServerHierarchicalMemoryResponse,
   setGeminiMdFilename as setServerGeminiMdFilename,
   resolveTelemetrySettings,
   FatalConfigError,
@@ -23,9 +24,7 @@ import {
   type ResumedSessionData,
   type LspClient,
   type ToolName,
-  EditTool,
-  ShellTool,
-  WriteFileTool,
+  ToolNames,
   NativeLspClient,
   createDebugLogger,
   NativeLspService,
@@ -33,8 +32,8 @@ import {
 } from '@qwen-code/qwen-code-core';
 import { extensionsCommand } from '../commands/extensions.js';
 import { hooksCommand } from '../commands/hooks.js';
-import type { Settings, LoadedSettings } from './settings.js';
-import { SettingScope } from './settings.js';
+import type { Settings } from './settings.js';
+import { loadSettings, SettingScope } from './settings.js';
 import { authCommand } from '../commands/auth.js';
 import {
   resolveCliGenerationConfig,
@@ -51,6 +50,7 @@ import { getCliVersion } from '../utils/version.js';
 import { loadSandboxConfig } from './sandboxConfig.js';
 import { appEvents } from '../utils/events.js';
 import { mcpCommand } from '../commands/mcp.js';
+import { channelCommand } from '../commands/channel.js';
 
 // UUID v4 regex pattern for validation
 const SESSION_ID_REGEX =
@@ -128,7 +128,6 @@ export interface CliArgs {
   acp: boolean | undefined;
   experimentalAcp: boolean | undefined;
   experimentalLsp: boolean | undefined;
-  experimentalHooks: boolean | undefined;
   extensions: string[] | undefined;
   listExtensions: boolean | undefined;
   openaiLogging: boolean | undefined;
@@ -161,6 +160,9 @@ export interface CliArgs {
   excludeTools: string[] | undefined;
   authType: string | undefined;
   channel: string | undefined;
+  jsonFd?: number | undefined;
+  jsonFile?: string | undefined;
+  inputFile?: string | undefined;
 }
 
 function normalizeOutputFormat(
@@ -195,7 +197,7 @@ export async function parseArguments(): Promise<CliArgs> {
     .locale('en')
     .scriptName('qwen')
     .usage(
-      'Usage: qwen [options] [command]\n\nQwen Code - Launch an interactive CLI, use -p/--prompt for non-interactive mode',
+      'Usage: sosh [options] [command]\n\nSosh - Launch an interactive CLI, use -p/--prompt for non-interactive mode',
     )
     .option('telemetry', {
       type: 'boolean',
@@ -260,7 +262,7 @@ export async function parseArguments(): Promise<CliArgs> {
     })
     .option('proxy', {
       type: 'string',
-      description: 'Proxy for Qwen Code, like schema://user:password@host:port',
+      description: 'Proxy for Sosh, like schema://user:password@host:port',
     })
     .deprecateOption(
       'proxy',
@@ -271,7 +273,7 @@ export async function parseArguments(): Promise<CliArgs> {
       description:
         'Enable chat recording to disk. If false, chat history is not saved and --continue/--resume will not work.',
     })
-    .command('$0 [query..]', 'Launch Qwen Code CLI', (yargsInstance: Argv) =>
+    .command('$0 [query..]', 'Launch Sosh CLI', (yargsInstance: Argv) =>
       yargsInstance
         .positional('query', {
           description:
@@ -350,12 +352,6 @@ export async function parseArguments(): Promise<CliArgs> {
           type: 'boolean',
           description:
             'Enable experimental LSP (Language Server Protocol) feature for code intelligence',
-          default: false,
-        })
-        .option('experimental-hooks', {
-          type: 'boolean',
-          description:
-            'Enable experimental hooks feature for lifecycle event customization',
           default: false,
         })
         .option('channel', {
@@ -465,6 +461,25 @@ export async function parseArguments(): Promise<CliArgs> {
             'Include partial assistant messages when using stream-json output.',
           default: false,
         })
+        .option('json-fd', {
+          type: 'number',
+          description:
+            'File descriptor for structured JSON event output (dual output mode). ' +
+            'The TUI renders normally on stdout while JSON events are written to this fd. ' +
+            'The caller must provide this fd via spawn stdio configuration.',
+        })
+        .option('json-file', {
+          type: 'string',
+          description:
+            'File path for structured JSON event output (dual output mode). ' +
+            'Can be a regular file, FIFO (named pipe), or /dev/fd/N.',
+        })
+        .option('input-file', {
+          type: 'string',
+          description:
+            'File path for receiving remote input commands (bidirectional sync). ' +
+            'An external process writes JSONL commands; the TUI watches and processes them.',
+        })
         .option('continue', {
           alias: 'c',
           type: 'boolean',
@@ -520,7 +535,7 @@ export async function parseArguments(): Promise<CliArgs> {
         })
         .deprecateOption(
           'sandbox-image',
-          'Use the "tools.sandbox" setting in settings.json instead. This flag will be removed in a future version.',
+          'Use the "tools.sandboxImage" setting in settings.json instead. This flag will be removed in a future version.',
         )
         .deprecateOption(
           'checkpointing',
@@ -580,6 +595,9 @@ export async function parseArguments(): Promise<CliArgs> {
           if (argv['resume'] && !isValidSessionId(argv['resume'] as string)) {
             return `Invalid --resume: "${argv['resume']}". Must be a valid UUID (e.g., "123e4567-e89b-12d3-a456-426614174000").`;
           }
+          if (argv['jsonFd'] != null && argv['jsonFile'] != null) {
+            return '--json-fd and --json-file are mutually exclusive. Use one or the other.';
+          }
           return true;
         }),
     )
@@ -590,7 +608,9 @@ export async function parseArguments(): Promise<CliArgs> {
     // Register Auth subcommands
     .command(authCommand)
     // Register Hooks subcommands
-    .command(hooksCommand);
+    .command(hooksCommand)
+    // Register Channel subcommands
+    .command(channelCommand);
 
   yargsInstance
     .version(await getCliVersion()) // This will enable the --version flag based on package.json
@@ -611,7 +631,8 @@ export async function parseArguments(): Promise<CliArgs> {
     result._.length > 0 &&
     (result._[0] === 'mcp' ||
       result._[0] === 'extensions' ||
-      result._[0] === 'hooks')
+      result._[0] === 'hooks' ||
+      result._[0] === 'channel')
   ) {
     // MCP/Extensions/Hooks commands handle their own execution and process exit
     process.exit(0);
@@ -669,7 +690,8 @@ export async function loadHierarchicalGeminiMemory(
   extensionContextFilePaths: string[] = [],
   folderTrust: boolean,
   memoryImportFormat: 'flat' | 'tree' = 'tree',
-): Promise<{ memoryContent: string; fileCount: number }> {
+  contextRuleExcludes: string[] = [],
+): Promise<LoadServerHierarchicalMemoryResponse> {
   // FIX: Use real, canonical paths for a reliable comparison to handle symlinks.
   const realCwd = fs.realpathSync(path.resolve(currentWorkingDirectory));
   const realHome = fs.realpathSync(path.resolve(homedir()));
@@ -687,6 +709,7 @@ export async function loadHierarchicalGeminiMemory(
     extensionContextFilePaths,
     folderTrust,
     memoryImportFormat,
+    contextRuleExcludes,
   );
 }
 
@@ -704,7 +727,14 @@ export async function loadCliConfig(
   argv: CliArgs,
   cwd: string = process.cwd(),
   overrideExtensions?: string[],
-  loadedSettings?: LoadedSettings,
+  /**
+   * Optional separated hooks for proper source attribution.
+   * If provided, these override settings.hooks for hook loading.
+   */
+  hooksConfig?: {
+    userHooks?: Record<string, unknown>;
+    projectHooks?: Record<string, unknown>;
+  },
 ): Promise<Config> {
   const debugMode = isDebugMode(argv);
 
@@ -923,13 +953,13 @@ export async function loadCliConfig(
       case ApprovalMode.PLAN:
       case ApprovalMode.DEFAULT:
         // Deny all write/execute tools unless explicitly allowed.
-        denyUnlessAllowed(ShellTool.Name as ToolName);
-        denyUnlessAllowed(EditTool.Name as ToolName);
-        denyUnlessAllowed(WriteFileTool.Name as ToolName);
+        denyUnlessAllowed(ToolNames.SHELL as ToolName);
+        denyUnlessAllowed(ToolNames.EDIT as ToolName);
+        denyUnlessAllowed(ToolNames.WRITE_FILE as ToolName);
         break;
       case ApprovalMode.AUTO_EDIT:
         // Only shell requires a prompt in auto-edit mode.
-        denyUnlessAllowed(ShellTool.Name as ToolName);
+        denyUnlessAllowed(ToolNames.SHELL as ToolName);
         break;
       case ApprovalMode.YOLO:
         // No extra denials for YOLO mode.
@@ -1042,20 +1072,19 @@ export async function loadCliConfig(
       deny: mergedDeny.length > 0 ? mergedDeny : undefined,
     },
     // Permission rule persistence callback (writes to settings files).
-    onPersistPermissionRule: loadedSettings
-      ? async (scope, ruleType, rule) => {
-          const settingScope =
-            scope === 'project' ? SettingScope.Workspace : SettingScope.User;
-          const key = `permissions.${ruleType}`;
-          const currentRules: string[] =
-            loadedSettings.forScope(settingScope).settings.permissions?.[
-              ruleType
-            ] ?? [];
-          if (!currentRules.includes(rule)) {
-            loadedSettings.setValue(settingScope, key, [...currentRules, rule]);
-          }
-        }
-      : undefined,
+    onPersistPermissionRule: async (scope, ruleType, rule) => {
+      const currentSettings = loadSettings(cwd);
+      const settingScope =
+        scope === 'project' ? SettingScope.Workspace : SettingScope.User;
+      const key = `permissions.${ruleType}`;
+      const currentRules: string[] =
+        currentSettings.forScope(settingScope).settings.permissions?.[
+          ruleType
+        ] ?? [];
+      if (!currentRules.includes(rule)) {
+        currentSettings.setValue(settingScope, key, [...currentRules, rule]);
+      }
+    },
     toolDiscoveryCommand: settings.tools?.discoveryCommand,
     toolCallCommand: settings.tools?.callCommand,
     mcpServerCommand: settings.mcp?.serverCommand,
@@ -1073,6 +1102,7 @@ export async function loadCliConfig(
     },
     telemetry: telemetrySettings,
     usageStatisticsEnabled: settings.privacy?.usageStatisticsEnabled ?? true,
+    clearContextOnIdle: settings.context?.clearContextOnIdle,
     fileFiltering: settings.context?.fileFiltering,
     checkpointing:
       argv.checkpointing || settings.general?.checkpointing?.enabled,
@@ -1091,6 +1121,7 @@ export async function loadCliConfig(
     maxSessionTurns:
       argv.maxSessionTurns ?? settings.model?.maxSessionTurns ?? -1,
     experimentalZedIntegration: argv.acp || argv.experimentalAcp || false,
+    cronEnabled: settings.experimental?.cron ?? false,
     listExtensions: argv.listExtensions || false,
     overrideExtensions: overrideExtensions || argv.extensions,
     noBrowser: !!process.env['NO_BROWSER'],
@@ -1102,6 +1133,7 @@ export async function loadCliConfig(
     generationConfigSources: resolvedCliConfig.sources,
     generationConfig: resolvedCliConfig.generationConfig,
     warnings: resolvedCliConfig.warnings,
+    allowedHttpHookUrls: settings.security?.allowedHttpHookUrls ?? [],
     cliVersion: await getCliVersion(),
     webSearch: buildWebSearchConfig(argv, settings, selectedAuthType),
     ideMode,
@@ -1122,11 +1154,22 @@ export async function loadCliConfig(
     output: {
       format: outputSettingsFormat,
     },
-    hooks: settings.hooks,
-    hooksConfig: settings.hooksConfig,
-    enableHooks:
-      argv.experimentalHooks === true || settings.hooksConfig?.enabled === true,
+    enableManagedAutoMemory: settings.memory?.enableManagedAutoMemory ?? true,
+    enableManagedAutoDream: settings.memory?.enableManagedAutoDream ?? false,
+    fastModel: settings.fastModel || undefined,
+    // Use separated hooks if provided, otherwise fall back to merged hooks
+    userHooks: hooksConfig?.userHooks ?? settings.hooks,
+    projectHooks: hooksConfig?.projectHooks,
+    hooks: settings.hooks, // Keep for backward compatibility
+    disableAllHooks: settings.disableAllHooks ?? false,
     channel: argv.channel,
+    // CLI flag wins over settings.json. `--json-fd` is fd-only (no settings
+    // equivalent — fd passing is a spawn-time concern). `--json-file` and
+    // `--input-file` fall back to settings.dualOutput.* when the flag is
+    // absent.
+    jsonFd: argv.jsonFd,
+    jsonFile: argv.jsonFile ?? settings.dualOutput?.jsonFile,
+    inputFile: argv.inputFile ?? settings.dualOutput?.inputFile,
     // Precedence: explicit CLI flag > settings file > default(true).
     // NOTE: do NOT set a yargs default for `chat-recording`, otherwise argv will
     // always be true and the settings file can never disable recording.

@@ -100,7 +100,7 @@ function createExtension({
   );
 
   if (addContextFile) {
-    fs.writeFileSync(path.join(extDir, 'QWEN.md'), 'context');
+    fs.writeFileSync(path.join(extDir, 'SOSH.md'), 'context');
   }
 
   if (contextFileName) {
@@ -171,7 +171,7 @@ describe('extension tests', () => {
       expect(extensions[0].config.name).toBe('test-extension');
     });
 
-    it('should load context file path when QWEN.md is present', async () => {
+    it('should load context file path when SOSH.md is present', async () => {
       createExtension({
         extensionsDir: userExtensionsDir,
         name: 'ext1',
@@ -192,7 +192,7 @@ describe('extension tests', () => {
       const ext1 = extensions.find((e) => e.config.name === 'ext1');
       const ext2 = extensions.find((e) => e.config.name === 'ext2');
       expect(ext1?.contextFiles).toEqual([
-        path.join(userExtensionsDir, 'ext1', 'QWEN.md'),
+        path.join(userExtensionsDir, 'ext1', 'SOSH.md'),
       ]);
       expect(ext2?.contextFiles).toEqual([]);
     });
@@ -217,7 +217,7 @@ describe('extension tests', () => {
       ]);
     });
 
-    it('should use default QWEN.md when contextFileName is empty array', async () => {
+    it('should use default SOSH.md when contextFileName is empty array', async () => {
       const extDir = path.join(userExtensionsDir, 'ext-empty-context');
       fs.mkdirSync(extDir, { recursive: true });
       fs.writeFileSync(
@@ -228,7 +228,7 @@ describe('extension tests', () => {
           contextFileName: [],
         }),
       );
-      fs.writeFileSync(path.join(extDir, 'QWEN.md'), 'context content');
+      fs.writeFileSync(path.join(extDir, 'SOSH.md'), 'context content');
 
       const manager = createExtensionManager();
       await manager.refreshCache();
@@ -237,7 +237,7 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       const ext = extensions.find((e) => e.config.name === 'ext-empty-context');
       expect(ext?.contextFiles).toEqual([
-        path.join(userExtensionsDir, 'ext-empty-context', 'QWEN.md'),
+        path.join(userExtensionsDir, 'ext-empty-context', 'SOSH.md'),
       ]);
     });
 
@@ -755,6 +755,20 @@ describe('extension tests', () => {
         const id = getExtensionId(config, metadata);
         expect(id).toBe(hashValue('https://github.com/owner/repo'));
       });
+
+      it('should use source as-is for non-GitHub git URLs (e.g., GitLab)', () => {
+        // For non-GitHub git servers, fall back to using the source URL directly
+        const config: ExtensionConfig = { name: 'test-ext', version: '1.0.0' };
+        const metadata = {
+          type: 'git' as const,
+          source: 'https://gitlab.company.com/team/extension-repo',
+        };
+
+        const id = getExtensionId(config, metadata);
+        expect(id).toBe(
+          hashValue('https://gitlab.company.com/team/extension-repo'),
+        );
+      });
     });
   });
 
@@ -794,9 +808,13 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
       expect(extensions[0].hooks!['PreToolUse']).toHaveLength(1);
-      expect(extensions[0].hooks!['PreToolUse']![0].hooks![0].command).toBe(
-        'echo "hello"',
-      );
+      expect(
+        (
+          extensions[0].hooks!['PreToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe('echo "hello"');
     });
 
     it('should load hooks from hooks/hooks.json when not in main config', async () => {
@@ -847,9 +865,13 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
       expect(extensions[0].hooks!['PostToolUse']).toHaveLength(1);
-      expect(extensions[0].hooks!['PostToolUse']![0].hooks![0].command).toBe(
-        `echo "installed in ${extensionDir}"`,
-      );
+      expect(
+        (
+          extensions[0].hooks!['PostToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe(`echo "installed in ${extensionDir}"`);
     });
 
     it('should substitute ${CLAUDE_PLUGIN_ROOT} variable in hooks', async () => {
@@ -887,9 +909,13 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
       expect(extensions[0].hooks!['PreToolUse']).toHaveLength(1);
-      expect(extensions[0].hooks!['PreToolUse']![0].hooks![0].command).toBe(
-        `${extensionDir}/scripts/setup.sh`,
-      );
+      expect(
+        (
+          extensions[0].hooks!['PreToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe(`${extensionDir}/scripts/setup.sh`);
     });
 
     it('should load hooks from config.hooks string path', async () => {
@@ -941,9 +967,13 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
       expect(extensions[0].hooks!['PreToolUse']).toHaveLength(1);
-      expect(extensions[0].hooks!['PreToolUse']![0].hooks![0].command).toBe(
-        'echo "custom hooks path"',
-      );
+      expect(
+        (
+          extensions[0].hooks!['PreToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe('echo "custom hooks path"');
     });
 
     it('should prefer config.hooks string path over hooks/hooks.json', async () => {
@@ -999,9 +1029,13 @@ describe('extension tests', () => {
 
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
-      expect(extensions[0].hooks!['PreToolUse']![0].hooks![0].command).toBe(
-        'echo "config path"',
-      );
+      expect(
+        (
+          extensions[0].hooks!['PreToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe('echo "config path"');
     });
 
     it('should substitute ${CLAUDE_PLUGIN_ROOT} in hooks file from config.hooks string path', async () => {
@@ -1051,9 +1085,13 @@ describe('extension tests', () => {
       expect(extensions).toHaveLength(1);
       expect(extensions[0].hooks).toBeDefined();
       expect(extensions[0].hooks!['PreToolUse']).toHaveLength(1);
-      expect(extensions[0].hooks!['PreToolUse']![0].hooks![0].command).toBe(
-        `${extensionDir}/scripts/setup.sh`,
-      );
+      expect(
+        (
+          extensions[0].hooks!['PreToolUse']![0].hooks![0] as {
+            command: string;
+          }
+        ).command,
+      ).toBe(`${extensionDir}/scripts/setup.sh`);
     });
   });
 });

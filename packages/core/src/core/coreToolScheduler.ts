@@ -40,7 +40,6 @@ import {
   ToolCallEvent,
   InputFormat,
   Kind,
-  SkillTool,
 } from '../index.js';
 import type {
   FunctionResponse,
@@ -49,7 +48,15 @@ import type {
   PartListUnion,
 } from '@google/genai';
 import { ToolNames } from '../tools/tool-names.js';
-import { buildPermissionRules } from '../permissions/rule-parser.js';
+import { CONCURRENCY_SAFE_KINDS } from '../tools/tools.js';
+import { isShellCommandReadOnly } from '../utils/shellReadOnlyChecker.js';
+import { stripShellWrapper } from '../utils/shell-utils.js';
+import {
+  buildPermissionCheckContext,
+  evaluatePermissionRules,
+  injectPermissionRulesIfMissing,
+  persistPermissionOutcome,
+} from './permission-helpers.js';
 import { getResponseTextFromParts } from '../utils/generateContentResponseUtilities.js';
 import type { ModifyContext } from '../tools/modifiable-tool.js';
 import {
@@ -57,10 +64,10 @@ import {
   modifyWithEditor,
 } from '../tools/modifiable-tool.js';
 import * as Diff from 'diff';
-import * as path from 'node:path';
 import levenshtein from 'fast-levenshtein';
 import { getPlanModeSystemReminder } from './prompts.js';
 import { ShellToolInvocation } from '../tools/shell.js';
+import { IdeClient } from '../ide/ide-client.js';
 
 const TRUNCATION_PARAM_GUIDANCE =
   'Note: Your previous response was truncated due to max_tokens limit, ' +
@@ -291,6 +298,15 @@ function toParts(input: PartListUnion): Part[] {
   return parts;
 }
 
+const VALIDATION_RETRY_LOOP_THRESHOLD = 3;
+
+/** Directive injected when a tool call repeatedly fails validation. */
+const RETRY_LOOP_STOP_DIRECTIVE =
+  '\n\n⚠️ RETRY LOOP DETECTED: This tool call has failed validation multiple times with the same error. ' +
+  'STOP retrying the same approach. Re-examine the tool schema and parameter requirements, then try a ' +
+  'fundamentally different approach. If you cannot resolve the validation error, explain the issue to the user ' +
+  'instead of retrying.';
+
 const createErrorResponse = (
   request: ToolCallRequestInfo,
   error: Error,
@@ -325,6 +341,58 @@ interface CoreToolSchedulerOptions {
   chatRecordingService?: ChatRecordingService;
 }
 
+// ─── Tool Concurrency Helpers ────────────────────────────────
+
+interface ToolBatch {
+  concurrent: boolean;
+  calls: ScheduledToolCall[];
+}
+
+/**
+ * Returns true if a scheduled tool call can safely execute concurrently
+ * with other safe tools (no side effects, no shared mutable state).
+ */
+function isConcurrencySafe(call: ScheduledToolCall): boolean {
+  // Agent tools spawn independent sub-agents with no shared state.
+  if (call.request.name === ToolNames.AGENT) return true;
+  // Shell commands: check if the command is read-only (e.g., git log, cat).
+  // Uses the synchronous regex+shell-quote checker (not the async AST-based
+  // one) because partitioning runs synchronously. The sync checker covers
+  // the same command whitelist and is fail-closed — unknown commands remain
+  // sequential. The AST version is used separately for permission decisions.
+  if (call.tool.kind === Kind.Execute) {
+    const command = (call.request.args as { command?: string }).command;
+    if (typeof command !== 'string') return false;
+    try {
+      return isShellCommandReadOnly(stripShellWrapper(command));
+    } catch {
+      return false; // fail-closed
+    }
+  }
+  return CONCURRENCY_SAFE_KINDS.has(call.tool.kind);
+}
+
+/**
+ * Partition tool calls into consecutive batches by concurrency safety.
+ *
+ * Consecutive safe tools are merged into a single parallel batch.
+ * Each unsafe tool forms its own sequential batch.
+ *
+ * Example: [Read, Read, Edit, Read] → [[Read,Read](parallel), [Edit](seq), [Read](seq)]
+ */
+function partitionToolCalls(calls: ScheduledToolCall[]): ToolBatch[] {
+  return calls.reduce<ToolBatch[]>((batches, call) => {
+    const safe = isConcurrencySafe(call);
+    const lastBatch = batches[batches.length - 1];
+    if (safe && lastBatch?.concurrent) {
+      lastBatch.calls.push(call);
+    } else {
+      batches.push({ concurrent: safe, calls: [call] });
+    }
+    return batches;
+  }, []);
+}
+
 export class CoreToolScheduler {
   private toolRegistry: ToolRegistry;
   private toolCalls: ToolCall[] = [];
@@ -337,6 +405,7 @@ export class CoreToolScheduler {
   private chatRecordingService?: ChatRecordingService;
   private isFinalizingToolCalls = false;
   private isScheduling = false;
+  private validationRetryCounts = new Map<string, number>();
   private requestQueue: Array<{
     request: ToolCallRequestInfo | ToolCallRequestInfo[];
     signal: AbortSignal;
@@ -403,6 +472,8 @@ export class CoreToolScheduler {
 
       switch (newStatus) {
         case 'success': {
+          // Successful execution only resets retry state for this tool
+          this.clearRetryCountsForTool(currentCall.request.name);
           const durationMs = existingStartTime
             ? Date.now() - existingStartTime
             : undefined;
@@ -550,6 +621,7 @@ export class CoreToolScheduler {
       const invocationOrError = this.buildInvocation(
         call.tool,
         args as Record<string, unknown>,
+        targetCallId,
       );
       if (invocationOrError instanceof Error) {
         const response = createErrorResponse(
@@ -586,9 +658,17 @@ export class CoreToolScheduler {
   private buildInvocation(
     tool: AnyDeclarativeTool,
     args: object,
+    callId?: string,
   ): AnyToolInvocation | Error {
     try {
-      return tool.build(args);
+      const invocation = tool.build(structuredClone(args));
+      if (callId) {
+        const maybeAware = invocation as { setCallId?: (id: string) => void };
+        if (typeof maybeAware.setCallId === 'function') {
+          maybeAware.setCallId(callId);
+        }
+      }
+      return invocation;
     } catch (e) {
       if (e instanceof Error) {
         return e;
@@ -601,13 +681,18 @@ export class CoreToolScheduler {
    * Generates error message for unknown tool. Returns early with skill-specific
    * message if the name matches a skill, otherwise uses Levenshtein suggestions.
    */
-  private getToolNotFoundMessage(unknownToolName: string, topN = 3): string {
+  private async getToolNotFoundMessage(
+    unknownToolName: string,
+    topN = 3,
+  ): Promise<string> {
     // Check if the unknown tool name matches an available skill name.
     // This handles the case where the model tries to invoke a skill as a tool
     // (e.g., Tool: "pdf" instead of Tool: "Skill" with skill: "pdf")
-    const skillTool = this.toolRegistry.getTool(ToolNames.SKILL);
-    if (skillTool instanceof SkillTool) {
-      const availableSkillNames = skillTool.getAvailableSkillNames();
+    const skillTool = await this.toolRegistry.ensureTool(ToolNames.SKILL);
+    if (skillTool && 'getAvailableSkillNames' in skillTool) {
+      const availableSkillNames = (
+        skillTool as { getAvailableSkillNames(): string[] }
+      ).getAvailableSkillNames();
       if (availableSkillNames.includes(unknownToolName)) {
         return `"${unknownToolName}" is a skill name, not a tool name. To use this skill, invoke the "${ToolNames.SKILL}" tool with parameter: skill: "${unknownToolName}"`;
       }
@@ -682,6 +767,20 @@ export class CoreToolScheduler {
     return this._schedule(request, signal);
   }
 
+  /**
+   * Removes all validation retry counters for the given tool. Keys are
+   * "<toolName>:<errorMessage>", so a plain `Map.delete(toolName)` would not
+   * match anything.
+   */
+  private clearRetryCountsForTool(toolName: string): void {
+    const prefix = `${toolName}:`;
+    for (const key of this.validationRetryCounts.keys()) {
+      if (key.startsWith(prefix)) {
+        this.validationRetryCounts.delete(key);
+      }
+    }
+  }
+
   private async _schedule(
     request: ToolCallRequestInfo | ToolCallRequestInfo[],
     signal: AbortSignal,
@@ -695,116 +794,164 @@ export class CoreToolScheduler {
       }
       const requestsToProcess = Array.isArray(request) ? request : [request];
 
-      const newToolCalls: ToolCall[] = requestsToProcess.map(
-        (reqInfo): ToolCall => {
-          // Check if the tool is excluded due to permissions/environment restrictions
-          // This check should happen before registry lookup to provide a clear permission error
-          const pm = this.config.getPermissionManager?.();
-          if (pm && !pm.isToolEnabled(reqInfo.name)) {
-            const permissionErrorMessage = `Sosh requires permission to use "${reqInfo.name}", but that permission was declined.`;
-            return {
-              status: 'error',
-              request: reqInfo,
-              response: createErrorResponse(
-                reqInfo,
-                new Error(permissionErrorMessage),
-                ToolErrorType.EXECUTION_DENIED,
-              ),
-              durationMs: 0,
-            };
-          }
+      // Check if this batch continues a validation retry loop.
+      // Keys are "<toolName>:<errorMessage>"; if no request reuses a tool name
+      // that previously failed validation, reset the tracker.
+      if (this.validationRetryCounts.size > 0) {
+        const prevTools = new Set<string>();
+        for (const key of this.validationRetryCounts.keys()) {
+          const sep = key.indexOf(':');
+          prevTools.add(sep === -1 ? key : key.slice(0, sep));
+        }
+        const hasPrevFailingTool = requestsToProcess.some((r) =>
+          prevTools.has(r.name),
+        );
+        if (!hasPrevFailingTool) {
+          this.validationRetryCounts.clear();
+        }
+      }
 
-          // Legacy fallback: check getPermissionsDeny() when PM is not available
-          if (!pm) {
-            const excludeTools =
-              this.config.getPermissionsDeny?.() ?? undefined;
-            if (excludeTools && excludeTools.length > 0) {
-              const normalizedToolName = reqInfo.name.toLowerCase().trim();
-              const excludedMatch = excludeTools.find(
-                (excludedTool) =>
-                  excludedTool.toLowerCase().trim() === normalizedToolName,
-              );
-              if (excludedMatch) {
-                const permissionErrorMessage = `Sosh requires permission to use ${excludedMatch}, but that permission was declined.`;
-                return {
-                  status: 'error',
-                  request: reqInfo,
-                  response: createErrorResponse(
-                    reqInfo,
-                    new Error(permissionErrorMessage),
-                    ToolErrorType.EXECUTION_DENIED,
-                  ),
-                  durationMs: 0,
-                };
-              }
+      const newToolCalls: ToolCall[] = [];
+      for (const reqInfo of requestsToProcess) {
+        // Check if the tool is excluded due to permissions/environment restrictions
+        // This check should happen before registry lookup to provide a clear permission error
+        const pm = this.config.getPermissionManager?.();
+        if (pm && !(await pm.isToolEnabled(reqInfo.name))) {
+          const matchingRule = pm.findMatchingDenyRule({
+            toolName: reqInfo.name,
+          });
+          const ruleInfo = matchingRule
+            ? ` Matching deny rule: "${matchingRule}".`
+            : '';
+          const permissionErrorMessage = `Sosh requires permission to use "${reqInfo.name}", but that permission was declined.${ruleInfo}`;
+          newToolCalls.push({
+            status: 'error',
+            request: reqInfo,
+            response: createErrorResponse(
+              reqInfo,
+              new Error(permissionErrorMessage),
+              ToolErrorType.EXECUTION_DENIED,
+            ),
+            durationMs: 0,
+          });
+          continue;
+        }
+
+        // Legacy fallback: check getPermissionsDeny() when PM is not available
+        if (!pm) {
+          const excludeTools = this.config.getPermissionsDeny?.() ?? undefined;
+          if (excludeTools && excludeTools.length > 0) {
+            const normalizedToolName = reqInfo.name.toLowerCase().trim();
+            const excludedMatch = excludeTools.find(
+              (excludedTool) =>
+                excludedTool.toLowerCase().trim() === normalizedToolName,
+            );
+            if (excludedMatch) {
+              const permissionErrorMessage = `Sosh requires permission to use ${excludedMatch}, but that permission was declined.`;
+              newToolCalls.push({
+                status: 'error',
+                request: reqInfo,
+                response: createErrorResponse(
+                  reqInfo,
+                  new Error(permissionErrorMessage),
+                  ToolErrorType.EXECUTION_DENIED,
+                ),
+                durationMs: 0,
+              });
+              continue;
             }
           }
+        }
 
-          const toolInstance = this.toolRegistry.getTool(reqInfo.name);
-          if (!toolInstance) {
-            // Tool is not in registry and not excluded - likely hallucinated or typo
-            const errorMessage = this.getToolNotFoundMessage(reqInfo.name);
-            return {
-              status: 'error',
-              request: reqInfo,
-              response: createErrorResponse(
-                reqInfo,
-                new Error(errorMessage),
-                ToolErrorType.TOOL_NOT_REGISTERED,
-              ),
-              durationMs: 0,
-            };
+        const toolInstance = await this.toolRegistry.ensureTool(reqInfo.name);
+        if (!toolInstance) {
+          // Tool is not in registry and not excluded - likely hallucinated or typo
+          const errorMessage = await this.getToolNotFoundMessage(reqInfo.name);
+          newToolCalls.push({
+            status: 'error',
+            request: reqInfo,
+            response: createErrorResponse(
+              reqInfo,
+              new Error(errorMessage),
+              ToolErrorType.TOOL_NOT_REGISTERED,
+            ),
+            durationMs: 0,
+          });
+          continue;
+        }
+
+        const invocationOrError = this.buildInvocation(
+          toolInstance,
+          reqInfo.args,
+          reqInfo.callId,
+        );
+        if (invocationOrError instanceof Error) {
+          const baseError = reqInfo.wasOutputTruncated
+            ? new Error(
+                `${invocationOrError.message} ${TRUNCATION_PARAM_GUIDANCE}`,
+              )
+            : invocationOrError;
+
+          // Track validation retry for loop detection. Counts accumulate per
+          // (tool, error message) pair so a different validation mistake on
+          // the same tool starts fresh rather than tripping the threshold.
+          const errorKey = `${reqInfo.name}:${baseError.message}`;
+          const count = (this.validationRetryCounts.get(errorKey) ?? 0) + 1;
+          for (const key of this.validationRetryCounts.keys()) {
+            if (key.startsWith(`${reqInfo.name}:`) && key !== errorKey) {
+              this.validationRetryCounts.delete(key);
+            }
           }
+          this.validationRetryCounts.set(errorKey, count);
 
-          const invocationOrError = this.buildInvocation(
-            toolInstance,
-            reqInfo.args,
-          );
-          if (invocationOrError instanceof Error) {
-            const error = reqInfo.wasOutputTruncated
-              ? new Error(
-                  `${invocationOrError.message} ${TRUNCATION_PARAM_GUIDANCE}`,
-                )
-              : invocationOrError;
-            return {
-              status: 'error',
-              request: reqInfo,
-              tool: toolInstance,
-              response: createErrorResponse(
-                reqInfo,
-                error,
-                ToolErrorType.INVALID_TOOL_PARAMS,
-              ),
-              durationMs: 0,
-            };
-          }
+          const finalError =
+            count >= VALIDATION_RETRY_LOOP_THRESHOLD
+              ? new Error(`${baseError.message}${RETRY_LOOP_STOP_DIRECTIVE}`)
+              : baseError;
 
-          // Reject file-modifying calls when truncated to prevent
-          // writing incomplete content.
-          if (reqInfo.wasOutputTruncated && toolInstance.kind === Kind.Edit) {
-            const truncationError = new Error(TRUNCATION_EDIT_REJECTION);
-            return {
-              status: 'error',
-              request: reqInfo,
-              tool: toolInstance,
-              response: createErrorResponse(
-                reqInfo,
-                truncationError,
-                ToolErrorType.OUTPUT_TRUNCATED,
-              ),
-              durationMs: 0,
-            };
-          }
-
-          return {
-            status: 'validating',
+          newToolCalls.push({
+            status: 'error',
             request: reqInfo,
             tool: toolInstance,
-            invocation: invocationOrError,
-            startTime: Date.now(),
-          };
-        },
-      );
+            response: createErrorResponse(
+              reqInfo,
+              finalError,
+              ToolErrorType.INVALID_TOOL_PARAMS,
+            ),
+            durationMs: 0,
+          });
+          continue;
+        }
+
+        // Reset all validation retry counters for this tool since it passed validation
+        this.clearRetryCountsForTool(reqInfo.name);
+
+        // Reject file-modifying calls when truncated to prevent
+        // writing incomplete content.
+        if (reqInfo.wasOutputTruncated && toolInstance.kind === Kind.Edit) {
+          const truncationError = new Error(TRUNCATION_EDIT_REJECTION);
+          newToolCalls.push({
+            status: 'error',
+            request: reqInfo,
+            tool: toolInstance,
+            response: createErrorResponse(
+              reqInfo,
+              truncationError,
+              ToolErrorType.OUTPUT_TRUNCATED,
+            ),
+            durationMs: 0,
+          });
+          continue;
+        }
+
+        newToolCalls.push({
+          status: 'validating',
+          request: reqInfo,
+          tool: toolInstance,
+          invocation: invocationOrError,
+          startTime: Date.now(),
+        });
+      }
 
       this.toolCalls = this.toolCalls.concat(newToolCalls);
       this.notifyToolCallsUpdate();
@@ -836,66 +983,14 @@ export class CoreToolScheduler {
 
           // ---- L4: PermissionManager override (if relevant rules exist) ----
           const pm = this.config.getPermissionManager?.();
-          let finalPermission = defaultPermission;
-          let pmForcedAsk = false;
-
-          // Build invocation context from tool params.
-          // This is used both by the PM evaluation below and later by
-          // centralized permission-rule generation (Always Allow).
           const toolParams = invocation.params as Record<string, unknown>;
-          const shellCommand =
-            'command' in toolParams ? String(toolParams['command']) : undefined;
-          // Extract file path — tools use 'file_path' or 'path'
-          // (LS / grep / glob).
-          let invocationFilePath =
-            typeof toolParams['file_path'] === 'string'
-              ? toolParams['file_path']
-              : undefined;
-          if (
-            invocationFilePath === undefined &&
-            typeof toolParams['path'] === 'string'
-          ) {
-            // LS uses absolute paths; grep/glob may be relative to targetDir.
-            invocationFilePath = path.isAbsolute(toolParams['path'])
-              ? toolParams['path']
-              : path.resolve(this.config.getTargetDir(), toolParams['path']);
-          }
-          let invocationDomain: string | undefined;
-          if (typeof toolParams['url'] === 'string') {
-            try {
-              invocationDomain = new URL(toolParams['url']).hostname;
-            } catch {
-              // malformed URL — leave domain undefined
-            }
-          }
-          // Generic specifier for literal matching (Skill name, Task subagent type, etc.)
-          const literalSpecifier =
-            typeof toolParams['skill'] === 'string'
-              ? toolParams['skill']
-              : typeof toolParams['subagent_type'] === 'string'
-                ? toolParams['subagent_type']
-                : undefined;
-          const pmCtx = {
-            toolName: reqInfo.name,
-            command: shellCommand,
-            filePath: invocationFilePath,
-            domain: invocationDomain,
-            specifier: literalSpecifier,
-          };
-
-          if (pm && defaultPermission !== 'deny') {
-            if (pm.hasRelevantRules(pmCtx)) {
-              const pmDecision = pm.evaluate(pmCtx);
-              if (pmDecision !== 'default') {
-                finalPermission = pmDecision;
-                // If PM explicitly forces 'ask', adding allow rules won't help
-                // because ask has higher priority. Hide "Always allow" options.
-                if (pmDecision === 'ask') {
-                  pmForcedAsk = true;
-                }
-              }
-            }
-          }
+          const pmCtx = buildPermissionCheckContext(
+            reqInfo.name,
+            toolParams,
+            this.config.getTargetDir?.() ?? '',
+          );
+          const { finalPermission, pmForcedAsk } =
+            await evaluatePermissionRules(pm, defaultPermission, pmCtx);
 
           // ---- L5: Final decision based on permission + ApprovalMode ----
           const approvalMode = this.config.getApprovalMode();
@@ -914,10 +1009,16 @@ export class CoreToolScheduler {
 
           if (finalPermission === 'deny') {
             // Hard deny: security violation or PM explicit deny
-            const denyMessage =
-              defaultPermission === 'deny'
-                ? `Tool "${reqInfo.name}" is denied: command substitution is not allowed for security reasons.`
-                : `Tool "${reqInfo.name}" is denied by permission rules.`;
+            let denyMessage: string;
+            if (defaultPermission === 'deny') {
+              denyMessage = `Tool "${reqInfo.name}" is denied: command substitution is not allowed for security reasons.`;
+            } else {
+              const matchingRule = pm?.findMatchingDenyRule(pmCtx);
+              const ruleInfo = matchingRule
+                ? ` Matching deny rule: "${matchingRule}".`
+                : '';
+              denyMessage = `Tool "${reqInfo.name}" is denied by permission rules.${ruleInfo}`;
+            }
             this.setStatusInternal(
               reqInfo.callId,
               'error',
@@ -936,6 +1037,7 @@ export class CoreToolScheduler {
           // it must bypass both YOLO auto-approve and plan-mode blocking.
           const isAskUserQuestionTool =
             reqInfo.name === ToolNames.ASK_USER_QUESTION;
+          let confirmationDetails: ToolCallConfirmationDetails | undefined;
 
           if (approvalMode === ApprovalMode.YOLO && !isAskUserQuestionTool) {
             this.setToolCallOutcome(
@@ -943,40 +1045,31 @@ export class CoreToolScheduler {
               ToolConfirmationOutcome.ProceedAlways,
             );
             this.setStatusInternal(reqInfo.callId, 'scheduled');
-          } else if (
-            isPlanMode &&
-            !isExitPlanModeTool &&
-            !isAskUserQuestionTool
-          ) {
-            this.setStatusInternal(reqInfo.callId, 'error', {
-              callId: reqInfo.callId,
-              responseParts: convertToFunctionResponse(
-                reqInfo.name,
-                reqInfo.callId,
-                getPlanModeSystemReminder(),
-              ),
-              resultDisplay: 'Plan mode blocked a non-read-only tool call.',
-              error: undefined,
-              errorType: undefined,
-            });
           } else {
-            // Get confirmation details from the tool
-            const confirmationDetails =
+            confirmationDetails =
               await invocation.getConfirmationDetails(signal);
 
             // ── Centralised rule injection ──────────────────────────────────
-            // If the tool did not provide its own permissionRules (e.g. Shell
-            // and WebFetch already do), generate minimum-scope rules from
-            // the invocation context so that "Always Allow" persists a
-            // properly scoped rule rather than nothing.
-            // Only exec/mcp/info types support the permissionRules field.
+            injectPermissionRulesIfMissing(confirmationDetails, pmCtx);
+
             if (
-              (confirmationDetails.type === 'exec' ||
-                confirmationDetails.type === 'mcp' ||
-                confirmationDetails.type === 'info') &&
-              !confirmationDetails.permissionRules
+              isPlanMode &&
+              !isExitPlanModeTool &&
+              !isAskUserQuestionTool &&
+              confirmationDetails.type !== 'info'
             ) {
-              confirmationDetails.permissionRules = buildPermissionRules(pmCtx);
+              this.setStatusInternal(reqInfo.callId, 'error', {
+                callId: reqInfo.callId,
+                responseParts: convertToFunctionResponse(
+                  reqInfo.name,
+                  reqInfo.callId,
+                  getPlanModeSystemReminder(),
+                ),
+                resultDisplay: 'Plan mode blocked a non-read-only tool call.',
+                error: undefined,
+                errorType: undefined,
+              });
+              continue;
             }
 
             // AUTO_EDIT mode: auto-approve edit-like and info tools
@@ -996,13 +1089,13 @@ export class CoreToolScheduler {
             /**
              * In non-interactive mode, automatically deny.
              */
-            const shouldAutoDeny =
+            const isNonInteractiveDeny =
               !this.config.isInteractive() &&
               !this.config.getExperimentalZedIntegration() &&
               this.config.getInputFormat() !== InputFormat.STREAM_JSON;
 
-            if (shouldAutoDeny) {
-              const errorMessage = `Sosh requires permission to use "${reqInfo.name}", but that permission was declined.`;
+            if (isNonInteractiveDeny) {
+              const errorMessage = `Sosh requires permission to use "${reqInfo.name}", but that permission was declined (non-interactive mode cannot prompt for confirmation).`;
               this.setStatusInternal(
                 reqInfo.callId,
                 'error',
@@ -1015,35 +1108,13 @@ export class CoreToolScheduler {
               continue;
             }
 
-            // Allow IDE to resolve confirmation
-            if (
-              confirmationDetails.type === 'edit' &&
-              confirmationDetails.ideConfirmation
-            ) {
-              confirmationDetails.ideConfirmation.then((resolution) => {
-                if (resolution.status === 'accepted') {
-                  this.handleConfirmationResponse(
-                    reqInfo.callId,
-                    confirmationDetails.onConfirm,
-                    ToolConfirmationOutcome.ProceedOnce,
-                    signal,
-                  );
-                } else {
-                  this.handleConfirmationResponse(
-                    reqInfo.callId,
-                    confirmationDetails.onConfirm,
-                    ToolConfirmationOutcome.Cancel,
-                    signal,
-                  );
-                }
-              });
-            }
-
             // Fire PermissionRequest hook before showing the permission dialog.
+            // Hooks run before the background-agent auto-deny so they can
+            // override the denial with policy-based decisions.
             const messageBus = this.config.getMessageBus() as
               | MessageBus
               | undefined;
-            const hooksEnabled = this.config.getEnableHooks();
+            const hooksEnabled = !this.config.getDisableAllHooks();
 
             if (hooksEnabled && messageBus) {
               const permissionMode = String(this.config.getApprovalMode());
@@ -1103,6 +1174,29 @@ export class CoreToolScheduler {
                 continue;
               }
             }
+
+            // Background agents can't show interactive prompts.
+            // Auto-deny after hooks have had a chance to decide.
+            if (this.config.getShouldAvoidPermissionPrompts?.()) {
+              const errorMessage = `Tool "${reqInfo.name}" requires permission, but background agents cannot prompt for confirmation. The tool call was denied.`;
+              this.setStatusInternal(
+                reqInfo.callId,
+                'error',
+                createErrorResponse(
+                  reqInfo,
+                  new Error(errorMessage),
+                  ToolErrorType.EXECUTION_DENIED,
+                ),
+              );
+              continue;
+            }
+
+            // Allow IDE to resolve confirmation
+            this.openIdeDiffIfEnabled(
+              confirmationDetails,
+              reqInfo.callId,
+              signal,
+            );
 
             const originalOnConfirm = confirmationDetails.onConfirm;
             const wrappedConfirmationDetails: ToolCallConfirmationDetails = {
@@ -1185,6 +1279,11 @@ export class CoreToolScheduler {
       (c) => c.request.callId === callId && c.status === 'awaiting_approval',
     );
 
+    // Guard: if the tool is no longer awaiting approval (already handled by
+    // another confirmation path, e.g. IDE vs CLI race), skip to avoid double
+    // processing and potential re-execution.
+    if (!toolCall) return;
+
     await originalOnConfirm(outcome, payload);
 
     if (
@@ -1193,37 +1292,13 @@ export class CoreToolScheduler {
       outcome === ToolConfirmationOutcome.ProceedAlwaysUser
     ) {
       // Persist permission rules for Project/User scope outcomes
-      if (
-        outcome === ToolConfirmationOutcome.ProceedAlwaysProject ||
-        outcome === ToolConfirmationOutcome.ProceedAlwaysUser
-      ) {
-        const scope =
-          outcome === ToolConfirmationOutcome.ProceedAlwaysProject
-            ? 'project'
-            : 'user';
-        // Read permissionRules from the stored confirmation details first,
-        // falling back to payload for backward compatibility.
-        const details = (toolCall as WaitingToolCall | undefined)
-          ?.confirmationDetails;
-        const detailsRules = (details as Record<string, unknown> | undefined)?.[
-          'permissionRules'
-        ] as string[] | undefined;
-        const payloadRules = payload?.permissionRules;
-        const rules = payloadRules ?? detailsRules ?? [];
-        const persistFn = this.config.getOnPersistPermissionRule?.();
-        const pm = this.config.getPermissionManager?.();
-        if (rules.length > 0) {
-          for (const rule of rules) {
-            // 1. Persist to disk (settings.json)
-            if (persistFn) {
-              await persistFn(scope, 'allow', rule);
-            }
-            // 2. Immediately update in-memory PermissionManager so the
-            //    new rule takes effect without restart.
-            pm?.addPersistentRule(rule, 'allow');
-          }
-        }
-      }
+      await persistPermissionOutcome(
+        outcome,
+        (toolCall as WaitingToolCall).confirmationDetails,
+        this.config.getOnPersistPermissionRule?.(),
+        this.config.getPermissionManager?.(),
+        payload,
+      );
       await this.autoApproveCompatiblePendingTools(signal, callId);
     }
 
@@ -1279,6 +1354,76 @@ export class CoreToolScheduler {
   }
 
   /**
+   * Opens an IDE diff view for edit-type tools when IDE mode is active.
+   * The IDE resolution is handled asynchronously — if the user accepts or
+   * rejects from the IDE, it triggers handleConfirmationResponse.
+   *
+   * Uses confirmationDetails.filePath / newContent (the same data shown in
+   * CLI diff) rather than ModifyContext so that the IDE diff is always
+   * consistent with the CLI and with resolveDiffFromCli.
+   */
+  private async openIdeDiffIfEnabled(
+    confirmationDetails: ToolCallConfirmationDetails,
+    callId: string,
+    signal: AbortSignal,
+  ) {
+    if (confirmationDetails.type !== 'edit' || !this.config.getIdeMode()) {
+      return;
+    }
+
+    let resolution: Awaited<ReturnType<IdeClient['openDiff']>>;
+    try {
+      const ideClient = await IdeClient.getInstance();
+      if (!ideClient.isDiffingEnabled()) return;
+
+      resolution = await ideClient.openDiff(
+        confirmationDetails.filePath,
+        confirmationDetails.newContent,
+      );
+    } catch (error) {
+      if (!signal.aborted) {
+        debugLogger.warn(
+          `IDE diff open failed for ${callId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return;
+    }
+
+    // Guard: skip if the tool was already handled (e.g. by CLI
+    // confirmation).  Without this check, resolveDiffFromCli
+    // triggers this handler AND the CLI's onConfirm, causing a
+    // race where ProceedOnce overwrites ProceedAlways.
+    const still = this.toolCalls.find(
+      (c) => c.request.callId === callId && c.status === 'awaiting_approval',
+    );
+    if (!still) return;
+
+    if (resolution.status === 'accepted') {
+      // When content is unchanged, skip the inline modify path so that
+      // the original tool params (e.g. partial old_string for edit tool)
+      // are preserved. Mitigate the multi-edit-on-same-file issue (#2702)
+      // for the common accept-without-edit case.
+      const userEdited =
+        resolution.content != null &&
+        resolution.content !== confirmationDetails.newContent;
+      await this.handleConfirmationResponse(
+        callId,
+        confirmationDetails.onConfirm,
+        ToolConfirmationOutcome.ProceedOnce,
+        signal,
+        userEdited ? { newContent: resolution.content } : undefined,
+      );
+    } else {
+      await this.handleConfirmationResponse(
+        callId,
+        confirmationDetails.onConfirm,
+        ToolConfirmationOutcome.Cancel,
+        signal,
+      );
+    }
+  }
+
+  /**
    * Applies user-provided content changes to a tool call that is awaiting confirmation.
    * This method updates the tool's arguments and refreshes the confirmation prompt with a new diff
    * before the tool is scheduled for execution.
@@ -1289,18 +1434,17 @@ export class CoreToolScheduler {
     payload: ToolConfirmationPayload,
     signal: AbortSignal,
   ): Promise<void> {
+    const confirmDetails = toolCall.confirmationDetails;
     if (
-      toolCall.confirmationDetails.type !== 'edit' ||
+      confirmDetails.type !== 'edit' ||
       !isModifiableDeclarativeTool(toolCall.tool) ||
       !payload.newContent
     ) {
       return;
     }
 
+    const currentContent = confirmDetails.originalContent ?? '';
     const modifyContext = toolCall.tool.getModifyContext(signal);
-    const currentContent = await modifyContext.getCurrentContent(
-      toolCall.request.args,
-    );
 
     const updatedParams = modifyContext.createUpdatedParams(
       currentContent,
@@ -1308,7 +1452,7 @@ export class CoreToolScheduler {
       toolCall.request.args,
     );
     const updatedDiff = Diff.createPatch(
-      modifyContext.getFilePath(toolCall.request.args),
+      confirmDetails.filePath,
       currentContent,
       payload.newContent,
       'Current',
@@ -1317,7 +1461,7 @@ export class CoreToolScheduler {
 
     this.setArgsInternal(toolCall.request.callId, updatedParams);
     this.setStatusInternal(toolCall.request.callId, 'awaiting_approval', {
-      ...toolCall.confirmationDetails,
+      ...confirmDetails,
       fileDiff: updatedDiff,
     });
   }
@@ -1335,32 +1479,51 @@ export class CoreToolScheduler {
 
     if (allCallsFinalOrScheduled) {
       const callsToExecute = this.toolCalls.filter(
-        (call) => call.status === 'scheduled',
+        (call): call is ScheduledToolCall => call.status === 'scheduled',
       );
 
-      // Task tools are safe to run concurrently — they spawn independent
-      // sub-agents with no shared mutable state.  All other tools run
-      // sequentially in their original order to preserve any implicit
-      // ordering the model may rely on.
-      const taskCalls = callsToExecute.filter(
-        (call) => call.request.name === ToolNames.AGENT,
-      );
-      const otherCalls = callsToExecute.filter(
-        (call) => call.request.name !== ToolNames.AGENT,
-      );
+      // Partition tool calls into consecutive batches by concurrency safety.
+      // Consecutive safe tools are grouped into parallel batches; unsafe
+      // tools each form their own sequential batch. Execute (shell) is safe
+      // only when isShellCommandReadOnly() returns true; otherwise sequential.
+      const batches = partitionToolCalls(callsToExecute);
 
-      const taskPromise = Promise.all(
-        taskCalls.map((tc) => this.executeSingleToolCall(tc, signal)),
-      );
-
-      const othersPromise = (async () => {
-        for (const toolCall of otherCalls) {
-          await this.executeSingleToolCall(toolCall, signal);
+      for (const batch of batches) {
+        if (batch.concurrent && batch.calls.length > 1) {
+          await this.runConcurrently(batch.calls, signal);
+        } else {
+          for (const call of batch.calls) {
+            await this.executeSingleToolCall(call, signal);
+          }
         }
-      })();
-
-      await Promise.all([taskPromise, othersPromise]);
+      }
     }
+  }
+
+  /**
+   * Execute multiple tool calls concurrently with a concurrency cap.
+   */
+  private async runConcurrently(
+    calls: ScheduledToolCall[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    const parsed = parseInt(
+      process.env['QWEN_CODE_MAX_TOOL_CONCURRENCY'] || '',
+      10,
+    );
+    const maxConcurrency = Number.isFinite(parsed) && parsed >= 1 ? parsed : 10;
+    const executing = new Set<Promise<void>>();
+
+    for (const call of calls) {
+      const p = this.executeSingleToolCall(call, signal).finally(() => {
+        executing.delete(p);
+      });
+      executing.add(p);
+      if (executing.size >= maxConcurrency) {
+        await Promise.race(executing);
+      }
+    }
+    await Promise.all(executing);
   }
 
   private async executeSingleToolCall(
@@ -1379,7 +1542,7 @@ export class CoreToolScheduler {
 
     // Get MessageBus for hook execution
     const messageBus = this.config.getMessageBus() as MessageBus | undefined;
-    const hooksEnabled = this.config.getEnableHooks();
+    const hooksEnabled = !this.config.getDisableAllHooks();
 
     // PreToolUse Hook
     if (hooksEnabled && messageBus) {
@@ -1527,6 +1690,21 @@ export class CoreToolScheduler {
           }
         }
 
+        // Inject conditional rules when the model accesses a matching file.
+        // Rules are injected at most once per session per rule file.
+        const filePath = toolInput?.['file_path'];
+        if (typeof filePath === 'string') {
+          const rulesCtx = this.config
+            .getConditionalRulesRegistry()
+            ?.matchAndConsume(filePath);
+          if (rulesCtx) {
+            content = appendAdditionalContext(
+              content,
+              `<system-reminder>\n${rulesCtx}\n</system-reminder>`,
+            );
+          }
+        }
+
         const response = convertToFunctionResponse(toolName, callId, content);
         const successResponse: ToolCallResponseInfo = {
           callId,
@@ -1535,6 +1713,11 @@ export class CoreToolScheduler {
           error: undefined,
           errorType: undefined,
           contentLength,
+          // Propagate modelOverride from skill tools. Use `in` to distinguish
+          // "skill returned undefined (inherit)" from "non-skill tool (no field)".
+          ...('modelOverride' in toolResult
+            ? { modelOverride: toolResult.modelOverride }
+            : {}),
         };
         this.setStatusInternal(callId, 'success', successResponse);
       } else {
@@ -1726,50 +1909,20 @@ export class CoreToolScheduler {
         // Re-run L3→L4 to see if the tool can now be auto-approved
         const defaultPermission =
           await pendingTool.invocation.getDefaultPermission();
-        let finalPermission = defaultPermission;
-
-        // L4: PM override
-        const pm = this.config.getPermissionManager?.();
-        if (pm && defaultPermission !== 'deny') {
-          const params = pendingTool.invocation.params as Record<
-            string,
-            unknown
-          >;
-          const shellCommand =
-            'command' in params ? String(params['command']) : undefined;
-          const filePath =
-            typeof params['file_path'] === 'string'
-              ? params['file_path']
-              : undefined;
-          let domain: string | undefined;
-          if (typeof params['url'] === 'string') {
-            try {
-              domain = new URL(params['url']).hostname;
-            } catch {
-              // malformed URL
-            }
-          }
-          // Generic specifier for literal matching (Skill name, Task subagent type, etc.)
-          const literalSpecifier =
-            typeof params['skill'] === 'string'
-              ? params['skill']
-              : typeof params['subagent_type'] === 'string'
-                ? params['subagent_type']
-                : undefined;
-          const pmCtx = {
-            toolName: pendingTool.request.name,
-            command: shellCommand,
-            filePath,
-            domain,
-            specifier: literalSpecifier,
-          };
-          if (pm.hasRelevantRules(pmCtx)) {
-            const pmDecision = pm.evaluate(pmCtx);
-            if (pmDecision !== 'default') {
-              finalPermission = pmDecision;
-            }
-          }
-        }
+        const toolParams = pendingTool.invocation.params as Record<
+          string,
+          unknown
+        >;
+        const pmCtx = buildPermissionCheckContext(
+          pendingTool.request.name,
+          toolParams,
+          this.config.getTargetDir?.() ?? '',
+        );
+        const { finalPermission } = await evaluatePermissionRules(
+          this.config.getPermissionManager?.(),
+          defaultPermission,
+          pmCtx,
+        );
 
         if (finalPermission === 'allow') {
           this.setToolCallOutcome(

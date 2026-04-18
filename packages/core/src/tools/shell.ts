@@ -37,7 +37,6 @@ import {
   getCommandRoots,
   splitCommands,
   stripShellWrapper,
-  detectCommandSubstitution,
 } from '../utils/shell-utils.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import {
@@ -92,17 +91,11 @@ export class ShellToolInvocation extends BaseToolInvocation<
 
   /**
    * AST-based permission check for the shell command.
-   * - Command substitution → 'deny' (security)
    * - Read-only commands (via AST analysis) → 'allow'
    * - All other commands → 'ask'
    */
   override async getDefaultPermission(): Promise<PermissionDecision> {
     const command = stripShellWrapper(this.params.command);
-
-    // Security: command substitution ($(), ``, <(), >()) → deny
-    if (detectCommandSubstitution(command)) {
-      return 'deny';
-    }
 
     // AST-based read-only detection
     try {
@@ -127,25 +120,40 @@ export class ShellToolInvocation extends BaseToolInvocation<
     _abortSignal: AbortSignal,
   ): Promise<ToolCallConfirmationDetails> {
     const command = stripShellWrapper(this.params.command);
+    const pm = this.config.getPermissionManager?.();
 
     // Split compound command and filter out already-allowed (read-only) sub-commands
     const subCommands = splitCommands(command);
-    const nonReadOnlySubCommands: string[] = [];
+    const confirmableSubCommands: string[] = [];
     for (const sub of subCommands) {
+      let isReadOnly = false;
       try {
-        const isReadOnly = await isShellCommandReadOnlyAST(sub);
-        if (!isReadOnly) {
-          nonReadOnlySubCommands.push(sub);
-        }
+        isReadOnly = await isShellCommandReadOnlyAST(sub);
       } catch {
-        nonReadOnlySubCommands.push(sub); // conservative: include if check fails
+        // conservative: treat unknown commands as requiring confirmation
       }
+
+      if (isReadOnly) {
+        continue;
+      }
+
+      if (pm) {
+        try {
+          if ((await pm.isCommandAllowed(sub)) === 'allow') {
+            continue;
+          }
+        } catch (e) {
+          debugLogger.warn('PermissionManager command check failed:', e);
+        }
+      }
+
+      confirmableSubCommands.push(sub);
     }
 
     // Fallback to all sub-commands if everything was filtered out (shouldn't
     // normally happen since getDefaultPermission already returned 'ask').
     const effectiveSubCommands =
-      nonReadOnlySubCommands.length > 0 ? nonReadOnlySubCommands : subCommands;
+      confirmableSubCommands.length > 0 ? confirmableSubCommands : subCommands;
 
     const rootCommands = [
       ...new Set(
@@ -551,6 +559,18 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
   - Edit files: Use ${ToolNames.EDIT} (NOT sed/awk)
   - Write files: Use ${ToolNames.WRITE_FILE} (NOT echo >/cat <<EOF)
   - Communication: Output text directly (NOT echo/printf)
+- **Shell argument quoting and special characters**: When passing arguments that contain special characters (parentheses \`()\`, backticks \`\`\`\`, dollar signs \`$\`, backslashes \`\\\`, semicolons \`;\`, pipes \`|\`, angle brackets \`<>\`, ampersands \`&\`, exclamation marks \`!\`, etc.), you MUST ensure they are properly quoted to prevent the shell from misinterpreting them as shell syntax:
+  - **Single quotes** \`'...'\` pass everything literally, but cannot contain a literal single quote.
+  - **ANSI-C quoting** \`$'...'\` supports escape sequences (e.g. \`\\n\` for newline, \`\\'\` for single quote) and is the safest approach for multi-line strings or strings with single quotes.
+  - **Heredoc** is the most robust approach for large, multi-line text with mixed quotes:
+    \`\`\`bash
+    gh pr create --title "My Title" --body "$(cat <<'HEREDOC'
+    Multi-line body with (parentheses), \`backticks\`, and 'single-quotes'.
+    HEREDOC
+    )"
+    \`\`\`
+  - NEVER use unescaped single quotes inside single-quoted strings (e.g. \`'it\\'s'\` is wrong; use \`$'it\\'s'\` or \`"it's"\` instead).
+  - If unsure, prefer double-quoting arguments and escape inner double-quotes as \`\\"\`.
 - When issuing multiple commands:
   - If the commands are independent and can run in parallel, make multiple run_shell_command tool calls in a single message. For example, if you need to run "git status" and "git diff", send a single message with two run_shell_command tool calls in parallel.
   - If the commands depend on each other and must run sequentially, use a single run_shell_command call with '&&' to chain them together (e.g., \`git add . && git commit -m "message" && git push\`). For instance, if one operation must complete before another starts (like mkdir before cp, Write before run_shell_command for git operations, or git add before git commit), run these operations sequentially instead.
@@ -583,18 +603,10 @@ ${processGroupNote}
 }
 
 function getCommandDescription(): string {
-  const cmd_substitution_warning =
-    '\n*** WARNING: Command substitution using $(), `` ` ``, <(), or >() is not allowed for security reasons.';
   if (os.platform() === 'win32') {
-    return (
-      'Exact command to execute as `cmd.exe /c <command>`' +
-      cmd_substitution_warning
-    );
+    return 'Exact command to execute as `cmd.exe /c <command>`';
   } else {
-    return (
-      'Exact bash command to execute as `bash -c <command>`' +
-      cmd_substitution_warning
-    );
+    return 'Exact bash command to execute as `bash -c <command>`';
   }
 }
 
@@ -647,9 +659,9 @@ export class ShellTool extends BaseDeclarativeTool<
   protected override validateToolParamValues(
     params: ShellToolParams,
   ): string | null {
-    // NOTE: Permission checks (command substitution, read-only detection, PM rules)
-    // are now handled at L3 (getDefaultPermission) and L4 (PM override) in
-    // coreToolScheduler. This method only performs pure parameter validation.
+    // NOTE: Permission checks (read-only detection, PM rules) are handled at
+    // L3 (getDefaultPermission) and L4 (PM override) in coreToolScheduler.
+    // This method only performs pure parameter validation.
     if (!params.command.trim()) {
       return 'Command cannot be empty.';
     }

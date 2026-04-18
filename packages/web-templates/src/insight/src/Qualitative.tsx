@@ -484,7 +484,7 @@ export function FrictionPoints({
   );
 }
 
-// Qwen.md Additions Section Component
+// SOSH.md Additions Section Component
 function QwenMdAdditionsSection({
   additions,
 }: {
@@ -522,9 +522,9 @@ function QwenMdAdditionsSection({
 
   return (
     <div className="qwen-md-section">
-      <h3>Suggested QWEN.md Additions</h3>
+      <h3>Suggested SOSH.md Additions</h3>
       <p className="text-xs text-slate-500 mb-3">
-        Just copy this into Qwen Code to add it to your QWEN.md.
+        Just copy this into Qwen Code to add it to your SOSH.md.
       </p>
 
       <div className="qwen-md-actions" style={{ marginBottom: '12px' }}>
@@ -575,7 +575,7 @@ export function Improvements({
         Existing Qwen Code Features to Try
       </h2>
 
-      {/* QWEN.md Additions */}
+      {/* SOSH.md Additions */}
       {Array.isArray(improvements.Qwen_md_additions) &&
         improvements.Qwen_md_additions.length > 0 && (
           <QwenMdAdditionsSection additions={improvements.Qwen_md_additions} />

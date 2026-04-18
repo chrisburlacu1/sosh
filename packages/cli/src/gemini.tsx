@@ -5,6 +5,7 @@
  */
 
 import {
+  AuthType,
   InputFormat,
   isDebugLoggingDegraded,
   logUserPrompt,
@@ -49,6 +50,10 @@ import { AppEvent, appEvents } from './utils/events.js';
 import { handleAutoUpdate } from './utils/handleAutoUpdate.js';
 import { readStdin } from './utils/readStdin.js';
 import {
+  profileCheckpoint,
+  finalizeStartupProfile,
+} from './utils/startupProfiler.js';
+import {
   relaunchAppInChildProcess,
   relaunchOnExitCode,
 } from './utils/relaunch.js';
@@ -61,6 +66,11 @@ import { computeWindowTitle } from './utils/windowTitle.js';
 import { validateNonInteractiveAuth } from './validateNonInterActiveAuth.js';
 import { showResumeSessionPicker } from './ui/components/StandaloneSessionPicker.js';
 import { initializeLlmOutputLanguage } from './utils/languageUtils.js';
+import { DualOutputBridge } from './dualOutput/DualOutputBridge.js';
+import { DualOutputContext } from './dualOutput/DualOutputContext.js';
+import { RemoteInputWatcher } from './remoteInput/RemoteInputWatcher.js';
+import { RemoteInputContext } from './remoteInput/RemoteInputContext.js';
+import { installTerminalRedrawOptimizer } from './ui/utils/terminalRedrawOptimizer.js';
 
 const debugLogger = createDebugLogger('STARTUP');
 
@@ -146,36 +156,89 @@ export async function startInteractiveUI(
 ) {
   const version = await getCliVersion();
   setWindowTitle(basename(workspaceRoot), settings);
+  const restoreTerminalRedrawOptimizer =
+    process.stdout.isTTY && !config.getScreenReader()
+      ? installTerminalRedrawOptimizer(process.stdout)
+      : () => {};
+
+  // Create dual output bridge if --json-fd or --json-file is specified.
+  // Errors are caught so a bad fd/path degrades gracefully instead of
+  // preventing the TUI from launching.
+  let dualOutputBridge: DualOutputBridge | null = null;
+  const jsonFd = config.getJsonFd?.();
+  const jsonFile = config.getJsonFile?.();
+  try {
+    if (jsonFd != null) {
+      dualOutputBridge = new DualOutputBridge(
+        config,
+        { fd: jsonFd },
+        { version },
+      );
+    } else if (jsonFile != null) {
+      dualOutputBridge = new DualOutputBridge(
+        config,
+        { filePath: jsonFile },
+        { version },
+      );
+    }
+  } catch (err) {
+    debugLogger.error('Failed to initialize dual output bridge:', err);
+    writeStderrLine(
+      `Warning: dual output disabled — ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Create remote input watcher if --input-file is specified.
+  // This enables bidirectional sync: an external process writes JSONL
+  // commands to this file, and the TUI processes them as user messages.
+  let remoteInputWatcher: RemoteInputWatcher | null = null;
+  const inputFile = config.getInputFile?.();
+  if (inputFile) {
+    try {
+      remoteInputWatcher = new RemoteInputWatcher(inputFile);
+    } catch (err) {
+      debugLogger.error('Failed to initialize remote input watcher:', err);
+      writeStderrLine(
+        `Warning: remote input disabled — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   // Create wrapper component to use hooks inside render
   const AppWrapper = () => {
     const kittyProtocolStatus = useKittyKeyboardProtocol();
     const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
     return (
-      <SettingsContext.Provider value={settings}>
-        <KeypressProvider
-          kittyProtocolEnabled={kittyProtocolStatus.enabled}
-          config={config}
-          debugKeystrokeLogging={settings.merged.general?.debugKeystrokeLogging}
-          pasteWorkaround={
-            process.platform === 'win32' || nodeMajorVersion < 20
-          }
-        >
-          <SessionStatsProvider sessionId={config.getSessionId()}>
-            <VimModeProvider settings={settings}>
-              <AgentViewProvider config={config}>
-                <AppContainer
-                  config={config}
-                  settings={settings}
-                  startupWarnings={startupWarnings}
-                  version={version}
-                  initializationResult={initializationResult}
-                />
-              </AgentViewProvider>
-            </VimModeProvider>
-          </SessionStatsProvider>
-        </KeypressProvider>
-      </SettingsContext.Provider>
+      <RemoteInputContext.Provider value={remoteInputWatcher}>
+        <DualOutputContext.Provider value={dualOutputBridge}>
+          <SettingsContext.Provider value={settings}>
+            <KeypressProvider
+              kittyProtocolEnabled={kittyProtocolStatus.enabled}
+              config={config}
+              debugKeystrokeLogging={
+                settings.merged.general?.debugKeystrokeLogging
+              }
+              pasteWorkaround={
+                process.platform === 'win32' || nodeMajorVersion < 20
+              }
+            >
+              <SessionStatsProvider sessionId={config.getSessionId()}>
+                <VimModeProvider settings={settings}>
+                  <AgentViewProvider config={config}>
+                    <AppContainer
+                      config={config}
+                      settings={settings}
+                      startupWarnings={startupWarnings}
+                      version={version}
+                      initializationResult={initializationResult}
+                    />
+                  </AgentViewProvider>
+                </VimModeProvider>
+              </SessionStatsProvider>
+            </KeypressProvider>
+          </SettingsContext.Provider>
+        </DualOutputContext.Provider>
+      </RemoteInputContext.Provider>
     );
   };
 
@@ -206,15 +269,23 @@ export async function startInteractiveUI(
       });
   }
 
-  registerCleanup(() => instance.unmount());
+  registerCleanup(async () => {
+    remoteInputWatcher?.shutdown();
+    await dualOutputBridge?.shutdown();
+    instance.unmount();
+    restoreTerminalRedrawOptimizer();
+  });
 }
 
 export async function main() {
+  profileCheckpoint('main_entry');
   setupUnhandledRejectionHandler();
   const settings = loadSettings();
   await cleanupCheckpoints();
+  profileCheckpoint('after_load_settings');
 
   let argv = await parseArguments();
+  profileCheckpoint('after_parse_arguments');
 
   // Check for invalid input combinations early to prevent crashes
   if (argv.promptInteractive && !process.stdin.isTTY) {
@@ -261,6 +332,11 @@ export async function main() {
         argv,
         undefined,
         [],
+        // Pass separated hooks for proper source attribution
+        {
+          userHooks: settings.getUserHooks(),
+          projectHooks: settings.getProjectHooks(),
+        },
       );
 
       if (!settings.merged.security?.auth?.useExternal) {
@@ -282,11 +358,13 @@ export async function main() {
           process.exit(1);
         }
       }
-      // For stream-json mode, don't read stdin here - it should be forwarded to the sandbox
-      // and consumed by StreamJsonInputReader inside the container
+      // For stream-json and ACP modes, don't read stdin here — stdin carries
+      // protocol data (not a user prompt) and should be forwarded to the sandbox
+      // intact via stdio: 'inherit'.
       const inputFormat = argv.inputFormat as string | undefined;
+      const isAcpMode = argv.acp || argv.experimentalAcp;
       let stdinData = '';
-      if (!process.stdin.isTTY && inputFormat !== 'stream-json') {
+      if (!process.stdin.isTTY && inputFormat !== 'stream-json' && !isAcpMode) {
         stdinData = await readStdin();
       }
 
@@ -348,6 +426,7 @@ export async function main() {
   // We are now past the logic handling potentially launching a child process
   // to run Qwen Code. It is now safe to perform expensive initialization that
   // may have side effects.
+  profileCheckpoint('after_sandbox_check');
 
   // Initialize output language file before config loads to ensure it's included in context
   initializeLlmOutputLanguage(settings.merged.general?.outputLanguage);
@@ -358,8 +437,13 @@ export async function main() {
       argv,
       process.cwd(),
       argv.extensions,
-      settings,
+      // Pass separated hooks for proper source attribution
+      {
+        userHooks: settings.getUserHooks(),
+        projectHooks: settings.getProjectHooks(),
+      },
     );
+    profileCheckpoint('after_load_cli_config');
 
     // Register cleanup for MCP clients as early as possible
     // This ensures MCP server subprocesses are properly terminated on exit
@@ -406,9 +490,13 @@ export async function main() {
     // For stream-json mode, defer config.initialize() until after the initialize control request
     // For other modes, initialize normally
     const initializationResult = await initializeApp(config, settings);
+    profileCheckpoint('after_initialize_app');
 
     if (config.getExperimentalZedIntegration()) {
-      return runAcpAgent(config, settings, argv);
+      await runAcpAgent(config, settings, argv);
+      // Clean up child processes and force exit, matching other non-interactive modes
+      await runExitCleanup();
+      process.exit(0);
     }
 
     let input = config.getQuestion();
@@ -422,10 +510,19 @@ export async function main() {
         })),
         ...getSettingsWarnings(settings),
         ...config.getWarnings(),
+        ...(config.getModelsConfig().getCurrentAuthType() ===
+        AuthType.QWEN_OAUTH
+          ? [
+              'Qwen OAuth free tier was discontinued on 2026-04-15. Run /auth to switch to Coding Plan or another provider.',
+            ]
+          : []),
       ]),
     ];
 
     // Render UI, passing necessary config values. Check that there is no command line question.
+    profileCheckpoint('before_render');
+    finalizeStartupProfile(config.getSessionId());
+
     if (config.isInteractive()) {
       // Need kitty detection to be complete before we can start the interactive UI.
       await kittyProtocolDetectionComplete;

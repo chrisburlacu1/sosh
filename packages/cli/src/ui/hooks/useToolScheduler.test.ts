@@ -45,6 +45,7 @@ vi.mock('@qwen-code/qwen-code-core', async () => {
 
 const mockToolRegistry = {
   getTool: vi.fn(),
+  ensureTool: vi.fn(async (name: string) => mockToolRegistry.getTool(name)),
   getAllToolNames: vi.fn(() => ['mockTool', 'anotherTool']),
 };
 
@@ -69,7 +70,7 @@ const mockConfig = {
   getShellExecutionConfig: () => ({ terminalWidth: 80, terminalHeight: 24 }),
   getChatRecordingService: () => undefined,
   getMessageBus: vi.fn().mockReturnValue(undefined),
-  getEnableHooks: vi.fn().mockReturnValue(false),
+  getDisableAllHooks: vi.fn().mockReturnValue(true),
   getHookSystem: vi.fn().mockReturnValue(undefined),
   getDebugLogger: vi.fn().mockReturnValue({
     debug: vi.fn(),
@@ -101,6 +102,7 @@ describe('useReactToolScheduler in YOLO Mode', () => {
     onComplete = vi.fn();
     setPendingHistoryItem = vi.fn();
     mockToolRegistry.getTool.mockClear();
+    mockToolRegistry.ensureTool.mockClear();
     (mockToolRequiresConfirmation.execute as Mock).mockClear();
     (mockToolRequiresConfirmation.getConfirmationDetails as Mock).mockClear();
 
@@ -207,6 +209,7 @@ describe('useReactToolScheduler', () => {
     setPendingHistoryItem = vi.fn();
 
     mockToolRegistry.getTool.mockClear();
+    mockToolRegistry.ensureTool.mockClear();
     (mockTool.execute as Mock).mockClear();
     (mockToolRequiresConfirmation.execute as Mock).mockClear();
     (mockToolRequiresConfirmation.getConfirmationDetails as Mock).mockClear();

@@ -35,6 +35,7 @@ describe('executeToolCall', () => {
 
     mockToolRegistry = {
       getTool: vi.fn(),
+      ensureTool: vi.fn(async (name: string) => mockToolRegistry.getTool(name)),
       getAllToolNames: vi.fn(),
     } as unknown as ToolRegistry;
 
@@ -63,7 +64,7 @@ describe('executeToolCall', () => {
       getGeminiClient: () => null, // No client needed for these tests
       getChatRecordingService: () => undefined,
       getMessageBus: vi.fn().mockReturnValue(undefined),
-      getEnableHooks: vi.fn().mockReturnValue(false),
+      getDisableAllHooks: vi.fn().mockReturnValue(true),
       getHookSystem: vi.fn().mockReturnValue(undefined),
       getDebugLogger: vi.fn().mockReturnValue({
         debug: vi.fn(),

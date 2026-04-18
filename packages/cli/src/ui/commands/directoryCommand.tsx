@@ -10,7 +10,10 @@ import { MessageType } from '../types.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { loadServerHierarchicalMemory } from '@qwen-code/qwen-code-core';
+import {
+  loadServerHierarchicalMemory,
+  ConditionalRulesRegistry,
+} from '@qwen-code/qwen-code-core';
 import { t } from '../../i18n/index.js';
 
 export function expandHomeDir(p: string): string {
@@ -147,7 +150,7 @@ export const directoryCommand: SlashCommand = {
 
         try {
           if (config.shouldLoadMemoryFromIncludeDirectories()) {
-            const { memoryContent, fileCount } =
+            const { memoryContent, fileCount, conditionalRules, projectRoot } =
               await loadServerHierarchicalMemory(
                 config.getWorkingDir(),
                 [
@@ -159,16 +162,20 @@ export const directoryCommand: SlashCommand = {
                 config.getFolderTrust(),
                 context.services.settings.merged.context?.importFormat ||
                   'tree', // Use setting or default to 'tree'
+                config.getContextRuleExcludes(),
               );
             config.setUserMemory(memoryContent);
             config.setGeminiMdFileCount(fileCount);
+            config.setConditionalRulesRegistry(
+              new ConditionalRulesRegistry(conditionalRules, projectRoot),
+            );
             context.ui.setGeminiMdFileCount(fileCount);
           }
           addItem(
             {
               type: MessageType.INFO,
               text: t(
-                'Successfully added QWEN.md files from the following directories if there are:\n- {{directories}}',
+                'Successfully added SOSH.md files from the following directories if there are:\n- {{directories}}',
                 {
                   directories: added.join('\n- '),
                 },

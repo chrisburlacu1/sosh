@@ -12,7 +12,7 @@ import {
   SessionEndReason,
   SessionStartSource,
   ToolNames,
-  SkillTool,
+  type PermissionMode,
 } from '@qwen-code/qwen-code-core';
 
 export const clearCommand: SlashCommand = {
@@ -26,14 +26,13 @@ export const clearCommand: SlashCommand = {
     const { config } = context.services;
 
     if (config) {
-      // Fire SessionEnd event before clearing (current session ends)
-      try {
-        await config
-          .getHookSystem()
-          ?.fireSessionEndEvent(SessionEndReason.Clear);
-      } catch (err) {
-        config.getDebugLogger().warn(`SessionEnd hook failed: ${err}`);
-      }
+      // Fire SessionEnd event (non-blocking to avoid UI lag)
+      config
+        .getHookSystem()
+        ?.fireSessionEndEvent(SessionEndReason.Clear)
+        .catch((err) => {
+          config.getDebugLogger().warn(`SessionEnd hook failed: ${err}`);
+        });
 
       const newSessionId = config.startNewSession();
 
@@ -45,13 +44,16 @@ export const clearCommand: SlashCommand = {
         .getToolRegistry()
         ?.getAllTools()
         .find((tool) => tool.name === ToolNames.SKILL);
-      if (skillTool instanceof SkillTool) {
-        skillTool.clearLoadedSkills();
+      if (skillTool && 'clearLoadedSkills' in skillTool) {
+        (skillTool as { clearLoadedSkills(): void }).clearLoadedSkills();
       }
 
       if (newSessionId && context.session.startNewSession) {
         context.session.startNewSession(newSessionId);
       }
+
+      // Clear UI first for immediate responsiveness
+      context.ui.clear();
 
       const geminiClient = config.getGeminiClient();
       if (geminiClient) {
@@ -65,21 +67,20 @@ export const clearCommand: SlashCommand = {
         context.ui.setDebugMessage(t('Starting a new session and clearing.'));
       }
 
-      // Fire SessionStart event after clearing (new session starts)
-      try {
-        await config
-          .getHookSystem()
-          ?.fireSessionStartEvent(
-            SessionStartSource.Clear,
-            config.getModel() ?? '',
-          );
-      } catch (err) {
-        config.getDebugLogger().warn(`SessionStart hook failed: ${err}`);
-      }
+      // Fire SessionStart event (non-blocking to avoid UI lag)
+      config
+        .getHookSystem()
+        ?.fireSessionStartEvent(
+          SessionStartSource.Clear,
+          config.getModel() ?? '',
+          String(config.getApprovalMode()) as PermissionMode,
+        )
+        .catch((err) => {
+          config.getDebugLogger().warn(`SessionStart hook failed: ${err}`);
+        });
     } else {
       context.ui.setDebugMessage(t('Starting a new session and clearing.'));
+      context.ui.clear();
     }
-
-    context.ui.clear();
   },
 };

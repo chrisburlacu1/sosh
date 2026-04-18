@@ -69,3 +69,7 @@ export function recordSubagentExecutionMetrics(...args: any[]) {}
 export function recordArenaSessionStartedMetrics(...args: any[]) {}
 export function recordArenaAgentCompletedMetrics(...args: any[]) {}
 export function recordArenaSessionEndedMetrics(...args: any[]) {}
+
+export function recordMemoryExtractMetrics(...args: any[]) {}
+export function recordMemoryDreamMetrics(...args: any[]) {}
+export function recordMemoryRecallMetrics(...args: any[]) {}

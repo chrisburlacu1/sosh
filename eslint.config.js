@@ -29,6 +29,7 @@ export default tseslint.config(
       'dist/**',
       'docs-site/.next/**',
       'docs-site/out/**',
+      '.qwen/**',
     ],
   },
   eslint.configs.recommended,
@@ -65,7 +66,7 @@ export default tseslint.config(
   },
   {
     // General overrides and rules for the project (TS/TSX files)
-    files: ['packages/*/src/**/*.{ts,tsx}'], // Target only TS/TSX in the cli package
+    files: ['packages/**/src/**/*.{ts,tsx}'], // Target TS/TSX in all packages (including nested)
     plugins: {
       import: importPlugin,
     },

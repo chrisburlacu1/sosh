@@ -40,3 +40,12 @@ export function logUserRetry(...args: any[]): void {}
 export function logArenaSessionStarted(...args: any[]): void {}
 export function logArenaAgentCompleted(...args: any[]): void {}
 export function logArenaSessionEnded(...args: any[]): void {}
+export function logHookCall(...args: any[]): void {}
+export function logPromptSuggestion(...args: any[]): void {}
+export function logSpeculation(...args: any[]): void {}
+export function logMemoryExtract(...args: any[]): void {}
+export function logMemoryDream(...args: any[]): void {}
+export function logMemoryRecall(...args: any[]): void {}
+export function recordMemoryExtractMetrics(...args: any[]): void {}
+export function recordMemoryDreamMetrics(...args: any[]): void {}
+export function recordMemoryRecallMetrics(...args: any[]): void {}

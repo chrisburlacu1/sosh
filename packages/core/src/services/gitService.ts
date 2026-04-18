@@ -54,11 +54,18 @@ export class GitService {
     // We don't want to inherit the user's name, email, or gpg signing
     // preferences for the shadow repository, so we create a dedicated gitconfig.
     const gitConfigContent =
-      '[user]\n  name = Qwen Code\n  email = qwen-code@qwen.ai\n[commit]\n  gpgsign = false\n';
+      '[user]\n  name = Sosh\n  email = qwen-code@qwen.ai\n[commit]\n  gpgsign = false\n';
     await fs.writeFile(gitConfigPath, gitConfigContent);
 
     const repo = simpleGit(repoDir);
-    const isRepoDefined = await repo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
+    let isRepoDefined = false;
+    try {
+      isRepoDefined = await repo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
+    } catch {
+      // Some Git/simple-git combinations throw for non-repo directories
+      // instead of returning false. Treat that as "not initialized yet".
+      isRepoDefined = false;
+    }
 
     if (!isRepoDefined) {
       await repo.init(false, {

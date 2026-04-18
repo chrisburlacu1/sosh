@@ -69,6 +69,8 @@ export interface IndividualToolCallDisplay {
   confirmationDetails: ToolCallConfirmationDetails | undefined;
   renderOutputAsMarkdown?: boolean;
   ptyId?: number;
+  /** If this tool call operated on a managed-auto-memory file, indicates whether it was a read or write. */
+  isMemoryOp?: 'read' | 'write';
 }
 
 export interface CompressionProps {
@@ -116,6 +118,8 @@ export type HistoryItemGeminiThoughtContent = HistoryItemBase & {
 export type HistoryItemInfo = HistoryItemBase & {
   type: 'info';
   text: string;
+  linkUrl?: string;
+  linkText?: string;
 };
 
 export type HistoryItemError = HistoryItemBase & {
@@ -182,9 +186,31 @@ export type HistoryItemQuit = HistoryItemBase & {
   duration: string;
 };
 
+/**
+ * Displayed after a turn when managed-auto-memory files were written
+ * (either in-turn by the model, or by the post-turn dream/extract pipeline).
+ */
+export type HistoryItemMemorySaved = HistoryItemBase & {
+  type: 'memory_saved';
+  /** Number of memory files written / updated. */
+  writtenCount: number;
+  /** Verb to display, e.g. 'Saved' or 'Updated'. Defaults to 'Saved'. */
+  verb?: string;
+};
+
 export type HistoryItemToolGroup = HistoryItemBase & {
   type: 'tool_group';
   tools: IndividualToolCallDisplay[];
+  /** Count of tool calls that wrote to managed-auto-memory files. Pre-computed for badge rendering. */
+  memoryWriteCount?: number;
+  /** Count of tool calls that read from managed-auto-memory files. Pre-computed for badge rendering. */
+  memoryReadCount?: number;
+  isUserInitiated?: boolean;
+};
+
+export type HistoryItemNotification = HistoryItemBase & {
+  type: 'notification';
+  text: string;
 };
 
 export type HistoryItemUserShell = HistoryItemBase & {
@@ -350,12 +376,54 @@ export type HistoryItemInsightProgress = HistoryItemBase & {
   progress: InsightProgressProps;
 };
 
+export interface BtwProps {
+  question: string;
+  answer: string;
+  isPending: boolean;
+}
+
+export type HistoryItemBtw = HistoryItemBase & {
+  type: 'btw';
+  btw: BtwProps;
+};
+
+/**
+ * UserPromptSubmit hook blocked event.
+ * Displayed when a UserPromptSubmit hook blocks the user's prompt.
+ */
+export type HistoryItemUserPromptSubmitBlocked = HistoryItemBase & {
+  type: 'user_prompt_submit_blocked';
+  reason: string;
+  originalPrompt: string;
+};
+
+/**
+ * Stop hook loop event.
+ * Displayed when Stop hooks create a loop, forcing the agent to continue.
+ */
+export type HistoryItemStopHookLoop = HistoryItemBase & {
+  type: 'stop_hook_loop';
+  iterationCount: number;
+  reasons: string[];
+  stopHookCount: number;
+};
+
+/**
+ * Stop hook system message.
+ * Displayed when Stop hooks return a systemMessage to show to the user.
+ */
+export type HistoryItemStopHookSystemMessage = HistoryItemBase & {
+  type: 'stop_hook_system_message';
+  message: string;
+};
+
 // Using Omit<HistoryItem, 'id'> seems to have some issues with typescript's
 // type inference e.g. historyItem.type === 'tool_group' isn't auto-inferring that
 // 'tools' in historyItem.
 // Individually exported types extending HistoryItemBase
 export type HistoryItemWithoutId =
   | HistoryItemUser
+  | HistoryItemNotification
   | HistoryItemUserShell
   | HistoryItemGemini
   | HistoryItemGeminiContent
@@ -383,7 +451,12 @@ export type HistoryItemWithoutId =
   | HistoryItemContextUsage
   | HistoryItemArenaAgentComplete
   | HistoryItemArenaSessionComplete
-  | HistoryItemInsightProgress;
+  | HistoryItemInsightProgress
+  | HistoryItemBtw
+  | HistoryItemMemorySaved
+  | HistoryItemUserPromptSubmitBlocked
+  | HistoryItemStopHookLoop
+  | HistoryItemStopHookSystemMessage;
 
 export type HistoryItem = HistoryItemWithoutId & { id: number };
 
@@ -411,6 +484,7 @@ export enum MessageType {
   ARENA_AGENT_COMPLETE = 'arena_agent_complete',
   ARENA_SESSION_COMPLETE = 'arena_session_complete',
   INSIGHT_PROGRESS = 'insight_progress',
+  BTW = 'btw',
 }
 
 export interface InsightProgressProps {
@@ -505,6 +579,8 @@ export interface ConsoleMessageItem {
 export interface SubmitPromptResult {
   type: 'submit_prompt';
   content: PartListUnion;
+  /** Optional callback invoked after the agent turn completes successfully. */
+  onComplete?: () => Promise<void>;
 }
 
 /**

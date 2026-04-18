@@ -21,6 +21,7 @@ import {
 } from './constants.js';
 
 export const OAUTH_DISPLAY_MESSAGE_EVENT = 'oauth-display-message' as const;
+export const OAUTH_AUTH_URL_EVENT = 'oauth-auth-url' as const;
 
 /**
  * Structured display message for i18n support.
@@ -261,6 +262,10 @@ export class MCPOAuthProvider {
               </html>
             `);
               activeCallbackServer = null;
+              if (activeCallbackTimeout) {
+                clearTimeout(activeCallbackTimeout);
+                activeCallbackTimeout = null;
+              }
               server.close();
               reject(new Error(`OAuth error: ${error}`));
               return;
@@ -276,6 +281,10 @@ export class MCPOAuthProvider {
               res.writeHead(400);
               res.end('Invalid state parameter');
               activeCallbackServer = null;
+              if (activeCallbackTimeout) {
+                clearTimeout(activeCallbackTimeout);
+                activeCallbackTimeout = null;
+              }
               server.close();
               reject(new Error('State mismatch - possible CSRF attack'));
               return;
@@ -287,17 +296,25 @@ export class MCPOAuthProvider {
             <html>
               <body>
                 <h1>Authentication Successful!</h1>
-                <p>You can close this window and return to Qwen Code.</p>
+                <p>You can close this window and return to Sosh.</p>
                 <script>window.close();</script>
               </body>
             </html>
           `);
 
             activeCallbackServer = null;
+            if (activeCallbackTimeout) {
+              clearTimeout(activeCallbackTimeout);
+              activeCallbackTimeout = null;
+            }
             server.close();
             resolve({ code, state });
           } catch (error) {
             activeCallbackServer = null;
+            if (activeCallbackTimeout) {
+              clearTimeout(activeCallbackTimeout);
+              activeCallbackTimeout = null;
+            }
             server.close();
             reject(error);
           }
@@ -802,6 +819,9 @@ export class MCPOAuthProvider {
     displayMessage({
       key: 'Make sure to copy the COMPLETE URL - it may wrap across multiple lines.',
     });
+    if (events) {
+      events.emit(OAUTH_AUTH_URL_EVENT, authUrl.toString());
+    }
 
     // Start callback server
     const callbackPromise = this.startCallbackServer(pkceParams.state);
