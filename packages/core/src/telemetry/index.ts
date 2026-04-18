@@ -88,8 +88,16 @@ export type {
   ArenaAgentCompletedStatus,
 } from './types.js';
 export type { TelemetryEvent } from './types.js';
-export { SpanStatusCode, ValueType } from '@opentelemetry/api';
-export { SemanticAttributes } from '@opentelemetry/semantic-conventions';
+export enum SpanStatusCode {
+  UNSET = 0,
+  OK = 1,
+  ERROR = 2,
+}
+export enum ValueType {
+  INT = 0,
+  DOUBLE = 1,
+}
+export const SemanticAttributes = {};
 export * from './uiTelemetry.js';
 export {
   // Core metrics functions

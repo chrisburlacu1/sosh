@@ -143,7 +143,7 @@ export function getCoreSystemPrompt(
   const basePrompt = systemMdEnabled
     ? fs.readFileSync(systemMdPath, 'utf8')
     : `
-You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.
+You are Sosh, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.
 
 # Core Mandates
 
@@ -891,7 +891,7 @@ type InsightPromptType =
   | 'at_a_glance';
 
 const INSIGHT_PROMPTS: Record<InsightPromptType, string> = {
-  analysis: `Analyze this Qwen Code session and extract structured facets.
+  analysis: `Analyze this Sosh session and extract structured facets.
 
 CRITICAL GUIDELINES:
 
@@ -924,7 +924,7 @@ CRITICAL GUIDELINES:
 
 4. If very short or just warmup, use warmup_minimal for goal_category`,
 
-  impressive_workflows: `Analyze this Qwen Code usage data and identify what's working well for this user. Use second person ("you").
+  impressive_workflows: `Analyze this Sosh usage data and identify what's working well for this user. Use second person ("you").
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
@@ -936,18 +936,18 @@ Call respond_in_schema function with A VALID JSON OBJECT as argument:
 
 Include 3 impressive workflows.`,
 
-  project_areas: `Analyze this Qwen Code usage data and identify project areas.
+  project_areas: `Analyze this Sosh usage data and identify project areas.
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
   "areas": [
-    {"name": "Area name", "session_count": N, "description": "2-3 sentences about what was worked on and how Qwen Code was used."}
+    {"name": "Area name", "session_count": N, "description": "2-3 sentences about what was worked on and how Sosh was used."}
   ]
 }
 
 Include 4-5 areas. Skip internal QC operations.`,
 
-  future_opportunities: `Analyze this Qwen Code usage data and identify future opportunities.
+  future_opportunities: `Analyze this Sosh usage data and identify future opportunities.
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
@@ -959,7 +959,7 @@ Call respond_in_schema function with A VALID JSON OBJECT as argument:
 
 Include 3 opportunities. Think BIG - autonomous workflows, parallel agents, iterating against tests.`,
 
-  friction_points: `Analyze this Qwen Code usage data and identify friction points for this user. Use second person ("you").
+  friction_points: `Analyze this Sosh usage data and identify friction points for this user. Use second person ("you").
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
@@ -971,7 +971,7 @@ Call respond_in_schema function with A VALID JSON OBJECT as argument:
 
 Include 3 friction categories with 2 examples each.`,
 
-  memorable_moment: `Analyze this Qwen Code usage data and find a memorable moment.
+  memorable_moment: `Analyze this Sosh usage data and find a memorable moment.
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
@@ -981,7 +981,7 @@ Call respond_in_schema function with A VALID JSON OBJECT as argument:
 
 Find something genuinely interesting or amusing from the session summaries.`,
 
-  improvements: `Analyze this Qwen Code usage data and suggest improvements.
+  improvements: `Analyze this Sosh usage data and suggest improvements.
 
 ## QC FEATURES REFERENCE (pick from these for features_to_try):
 1. **MCP Servers**: Connect Qwen to external tools, databases, and APIs via Model Context Protocol.
@@ -1038,16 +1038,16 @@ IMPORTANT for Qwen_md_additions: PRIORITIZE instructions that appear MULTIPLE TI
 
 IMPORTANT for features_to_try: Pick 2-3 from the QC FEATURES REFERENCE above. Include 2-3 items for each category.`,
 
-  interaction_style: `Analyze this Qwen Code usage data and describe the user's interaction style.
+  interaction_style: `Analyze this Sosh usage data and describe the user's interaction style.
 
 Call respond_in_schema function with A VALID JSON OBJECT as argument:
 {
-  "narrative": "2-3 paragraphs analyzing HOW the user interacts with Qwen Code. Use second person 'you'. Describe patterns: iterate quickly vs detailed upfront specs? Interrupt often or let Qwen run? Include specific examples. Use **bold** for key insights.",
+  "narrative": "2-3 paragraphs analyzing HOW the user interacts with Sosh. Use second person 'you'. Describe patterns: iterate quickly vs detailed upfront specs? Interrupt often or let Qwen run? Include specific examples. Use **bold** for key insights.",
   "key_pattern": "One sentence summary of most distinctive interaction style"
 }
 `,
 
-  at_a_glance: `You're writing an "At a Glance" summary for a Qwen Code usage insights report for Qwen Code users. The goal is to help them understand their usage and improve how they can use Qwen better, especially as models improve.
+  at_a_glance: `You're writing an "At a Glance" summary for a Sosh usage insights report for Sosh users. The goal is to help them understand their usage and improve how they can use Qwen better, especially as models improve.
 
 Use this 4-part structure:
 
@@ -1055,7 +1055,7 @@ Use this 4-part structure:
 
 2. **What's hindering you** - Split into (a) Qwen's fault (misunderstandings, wrong approaches, bugs) and (b) user-side friction (not providing enough context, environment issues -- ideally more general than just one project). Be honest but constructive.
 
-3. **Quick wins to try** - Specific Qwen Code features they could try from the examples below, or a workflow technique if you think it's really compelling. (Avoid stuff like "Ask Qwen to confirm before taking actions" or "Type out more context up front" which are less compelling.)
+3. **Quick wins to try** - Specific Sosh features they could try from the examples below, or a workflow technique if you think it's really compelling. (Avoid stuff like "Ask Qwen to confirm before taking actions" or "Type out more context up front" which are less compelling.)
 
 4. **Ambitious workflows for better models** - As we move to much more capable models over the next 3-6 months, what should they prepare for? What workflows that seem impossible now will become possible? Draw from the appropriate section below.
 

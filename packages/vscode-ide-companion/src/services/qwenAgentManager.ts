@@ -382,13 +382,10 @@ export class QwenAgentManager {
     try {
       await this.connection.setModel(modelId);
       const confirmedModelId = modelId;
-      const modelInfo = this.baselineAvailableModels.find(
-        (model) => model.modelId === confirmedModelId,
-      ) ?? {
+      const modelInfo: ModelInfo = {
         modelId: confirmedModelId,
         name: confirmedModelId,
       };
-      this.baselineModelInfo = modelInfo;
       this.callbacks.onModelChanged?.(modelInfo);
       return modelInfo;
     } catch (err) {

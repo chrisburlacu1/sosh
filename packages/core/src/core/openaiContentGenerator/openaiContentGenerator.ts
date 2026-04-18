@@ -79,6 +79,16 @@ export class OpenAIContentGenerator implements ContentGenerator {
     return this.pipeline.executeStream(request, userPromptId);
   }
 
+  async listModels(): Promise<string[]> {
+    try {
+      const response = await this.pipeline.client.models.list();
+      return response.data.map((model) => model.id);
+    } catch (error) {
+      debugLogger.warn('Failed to list models from OpenAI provider:', error);
+      return [];
+    }
+  }
+
   async countTokens(
     request: CountTokensParameters,
   ): Promise<CountTokensResponse> {

@@ -1665,8 +1665,27 @@ export class Config {
   getFileFilteringRespectGitIgnore(): boolean {
     return this.fileFiltering.respectGitIgnore;
   }
+
   getFileFilteringRespectQwenIgnore(): boolean {
     return this.fileFiltering.respectQwenIgnore;
+  }
+
+  /**
+   * Fetch dynamically available models from the currently configured provider.
+   * This accesses the underlying network to fetch from `/models` explicitly.
+   * Fails gracefully and returns an empty array if unsupported.
+   */
+  async fetchLiveModelsForCurrentAuthType(): Promise<string[]> {
+    try {
+      if (!this.contentGenerator) return [];
+      if (typeof this.contentGenerator.listModels === 'function') {
+        const models = await this.contentGenerator.listModels();
+        return models;
+      }
+    } catch (e) {
+      this.debugLogger.warn('Failed to fetch live models in Config:', e);
+    }
+    return [];
   }
 
   getFileFilteringOptions(): FileFilteringOptions {

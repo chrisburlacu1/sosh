@@ -71,7 +71,7 @@ const renderWithProviders = (
 describe('<AppHeader />', () => {
   it('shows the working directory', () => {
     const { lastFrame } = renderWithProviders(createMockUIState());
-    expect(lastFrame()).toContain('/projects/qwen-code');
+    expect(lastFrame()).toContain('/projects/sosh');
   });
 
   it('hides the header when screen reader is enabled', () => {
@@ -81,13 +81,13 @@ describe('<AppHeader />', () => {
       createMockConfig({ getScreenReader: vi.fn(() => true) }),
     );
     // When screen reader is enabled, header is not rendered
-    expect(lastFrame()).not.toContain('/projects/qwen-code');
-    expect(lastFrame()).not.toContain('Qwen Code');
+    expect(lastFrame()).not.toContain('/projects/sosh');
+    expect(lastFrame()).not.toContain('Sosh');
   });
 
   it('shows the header with all info when banner is visible', () => {
     const { lastFrame } = renderWithProviders(createMockUIState());
-    expect(lastFrame()).toContain('>_ Qwen Code');
+    expect(lastFrame()).toContain('>_ Sosh');
     expect(lastFrame()).toContain('gemini-pro');
     expect(lastFrame()).toContain('/projects/qwen-code');
   });

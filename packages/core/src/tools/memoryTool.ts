@@ -76,7 +76,7 @@ Do NOT use this tool:
 `;
 
 export const QWEN_CONFIG_DIR = '.qwen';
-export const DEFAULT_CONTEXT_FILENAME = 'QWEN.md';
+export const DEFAULT_CONTEXT_FILENAME = 'SOSH.md';
 export const AGENT_CONTEXT_FILENAME = 'AGENTS.md';
 export const MEMORY_SECTION_HEADER = '## Qwen Added Memories';
 

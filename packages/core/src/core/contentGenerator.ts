@@ -45,6 +45,8 @@ export interface ContentGenerator {
     userPromptId: string,
   ): Promise<AsyncGenerator<GenerateContentResponse>>;
 
+  listModels?(): Promise<string[]>;
+
   countTokens(request: CountTokensParameters): Promise<CountTokensResponse>;
 
   embedContent(request: EmbedContentParameters): Promise<EmbedContentResponse>;

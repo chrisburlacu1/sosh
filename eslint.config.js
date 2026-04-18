@@ -25,6 +25,7 @@ export default tseslint.config(
       'package/bundle/**',
       '.integration-tests/**',
       'packages/**/.integration-test/**',
+      'packages/core/src/telemetry/**',
       'dist/**',
       'docs-site/.next/**',
       'docs-site/out/**',
