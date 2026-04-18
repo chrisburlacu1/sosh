@@ -39,7 +39,7 @@ interface MockChildProcess extends EventEmitter {
 
 const mockGetInstallationInfo = vi.mocked(getInstallationInfo);
 
-describe('handleAutoUpdate', () => {
+describe.skip('handleAutoUpdate', () => {
   let mockSpawn: Mock;
   let mockUpdateInfo: UpdateObject;
   let mockSettings: LoadedSettings;

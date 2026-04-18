@@ -6,81 +6,80 @@
 
 import type { UpdateObject } from '../ui/utils/updateCheck.js';
 import type { LoadedSettings } from '../config/settings.js';
-import { getInstallationInfo } from './installationInfo.js';
 import { updateEventEmitter } from './updateEventEmitter.js';
 import type { HistoryItem } from '../ui/types.js';
 import { MessageType } from '../ui/types.js';
 import { spawnWrapper } from './spawnWrapper.js';
 import type { spawn } from 'node:child_process';
-import os from 'node:os';
 
 export function handleAutoUpdate(
   info: UpdateObject | null,
   settings: LoadedSettings,
   projectRoot: string,
-  spawnFn: typeof spawn = spawnWrapper,
+  _spawnFn: typeof spawn = spawnWrapper,
 ) {
-  if (!info) {
-    return;
-  }
+  return undefined; // Disabled to prevent external network traffic
+  // if (!info) {
+  //   return;
+  // }
 
-  // enableAutoUpdate is checked in gemini.tsx before calling this function,
-  // so if we get here, auto-update is enabled (or undefined, which defaults to enabled).
-  const isAutoUpdateEnabled =
-    settings.merged.general?.enableAutoUpdate !== false;
+  // // enableAutoUpdate is checked in gemini.tsx before calling this function,
+  // // so if we get here, auto-update is enabled (or undefined, which defaults to enabled).
+  // const isAutoUpdateEnabled =
+  //   settings.merged.general?.enableAutoUpdate !== false;
 
-  const installationInfo = getInstallationInfo(
-    projectRoot,
-    isAutoUpdateEnabled,
-  );
+  // const installationInfo = getInstallationInfo(
+  //   projectRoot,
+  //   isAutoUpdateEnabled,
+  // );
 
-  let combinedMessage = info.message;
-  if (installationInfo.updateMessage) {
-    combinedMessage += `\n${installationInfo.updateMessage}`;
-  }
+  // let combinedMessage = info.message;
+  // if (installationInfo.updateMessage) {
+  //   combinedMessage += `\n${installationInfo.updateMessage}`;
+  // }
 
-  updateEventEmitter.emit('update-received', {
-    message: combinedMessage,
-  });
+  // updateEventEmitter.emit('update-received', {
+  //   message: combinedMessage,
+  // });
 
-  // Don't automatically run the update if auto-update is disabled or no update command
-  if (!installationInfo.updateCommand || !isAutoUpdateEnabled) {
-    return;
-  }
-  const isNightly = info.update.latest.includes('nightly');
+  // // Don't automatically run the update if auto-update is disabled or no update command
+  // if (!installationInfo.updateCommand || !isAutoUpdateEnabled) {
+  //   return;
+  // }
+  // const isNightly = info.update.latest.includes('nightly');
 
-  const updateCommand = installationInfo.updateCommand.replace(
-    '@latest',
-    isNightly ? '@nightly' : `@${info.update.latest}`,
-  );
-  const isWindows = os.platform() === 'win32';
-  const shell = isWindows ? 'cmd.exe' : 'bash';
-  const shellArgs = isWindows ? ['/c', updateCommand] : ['-c', updateCommand];
-  const updateProcess = spawnFn(shell, shellArgs, { stdio: 'pipe' });
-  let errorOutput = '';
-  updateProcess.stderr.on('data', (data) => {
-    errorOutput += data.toString();
-  });
+  // const updateCommand = installationInfo.updateCommand.replace(
+  //   '@latest',
+  //   isNightly ? '@nightly' : `@${info.update.latest}`,
+  // );
+  // const isWindows = os.platform() === 'win32';
+  // const shell = isWindows ? 'cmd.exe' : 'bash';
+  // const shellArgs = isWindows ? ['/c', updateCommand] : ['-c', updateCommand];
+  // const updateProcess = spawnFn(shell, shellArgs, { stdio: 'pipe' });
+  // let errorOutput = '';
+  // updateProcess.stderr.on('data', (data) => {
+  //   errorOutput += data.toString();
+  // });
 
-  updateProcess.on('close', (code) => {
-    if (code === 0) {
-      updateEventEmitter.emit('update-success', {
-        message:
-          'Update successful! The new version will be used on your next run.',
-      });
-    } else {
-      updateEventEmitter.emit('update-failed', {
-        message: `Automatic update failed. Please try updating manually. (command: ${updateCommand}, stderr: ${errorOutput.trim()})`,
-      });
-    }
-  });
+  // updateProcess.on('close', (code) => {
+  //   if (code === 0) {
+  //     updateEventEmitter.emit('update-success', {
+  //       message:
+  //         'Update successful! The new version will be used on your next run.',
+  //     });
+  //   } else {
+  //     updateEventEmitter.emit('update-failed', {
+  //       message: `Automatic update failed. Please try updating manually. (command: ${updateCommand}, stderr: ${errorOutput.trim()})`,
+  //     });
+  //   }
+  // });
 
-  updateProcess.on('error', (err) => {
-    updateEventEmitter.emit('update-failed', {
-      message: `Automatic update failed. Please try updating manually. (error: ${err.message})`,
-    });
-  });
-  return updateProcess;
+  // updateProcess.on('error', (err) => {
+  //   updateEventEmitter.emit('update-failed', {
+  //     message: `Automatic update failed. Please try updating manually. (error: ${err.message})`,
+  //   });
+  // });
+  // return updateProcess;
 }
 
 export function setUpdateHandler(
