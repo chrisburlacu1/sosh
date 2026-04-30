@@ -77,7 +77,7 @@ import { getErrorMessage } from '../utils/errors.js';
 import { checkNextSpeaker } from '../utils/nextSpeakerChecker.js';
 import { flatMapTextParts } from '../utils/partUtils.js';
 import { promptIdContext } from '../utils/promptIdContext.js';
-import { retryWithBackoff } from '../utils/retry.js';
+import { retryWithBackoff, isUnattendedMode } from '../utils/retry.js';
 
 // Hook types and utilities
 import {
@@ -156,17 +156,6 @@ export class GeminiClient {
    */
   private lastApiCompletionTimestamp: number | null = null;
 
-  /**
-   * Sticky-on latch for clearing thinking blocks from prior turns.
-   * Triggered when idle exceeds the configured threshold (default 5 min,
-   * aligned with provider prompt-cache TTL). Once latched, stays true to
-   * prevent oscillation: without it, thinking would accumulate → get
-   * stripped → accumulate again, causing the message prefix to change
-   * repeatedly (bad for provider-side prompt caching and wastes context).
-   * Reset on /clear (resetChat).
-   */
-  private thinkingClearLatched = false;
-
   constructor(private readonly config: Config) {
     this.loopDetector = new LoopDetectionService(config);
   }
@@ -215,16 +204,17 @@ export class GeminiClient {
     return this.getChat().getHistory(curated);
   }
 
-  stripThoughtsFromHistory() {
-    this.getChat().stripThoughtsFromHistory();
-  }
-
   private stripOrphanedUserEntriesFromHistory() {
     this.getChat().stripOrphanedUserEntriesFromHistory();
   }
 
   setHistory(history: Content[]) {
     this.getChat().setHistory(history);
+    this.forceFullIdeContext = true;
+  }
+
+  truncateHistory(keepCount: number) {
+    this.getChat().truncateHistory(keepCount);
     this.forceFullIdeContext = true;
   }
 
@@ -242,8 +232,6 @@ export class GeminiClient {
 
   async resetChat(): Promise<void> {
     this.surfacedRelevantAutoMemoryPaths.clear();
-    // Reset thinking clear latch — fresh chat, no prior thinking to clean up
-    this.thinkingClearLatched = false;
     this.lastApiCompletionTimestamp = null;
     await this.startChat();
   }
@@ -695,29 +683,6 @@ export class GeminiClient {
         this.config.getChatRecordingService()?.recordUserMessage(request);
       }
 
-      // Idle cleanup: clear stale thinking blocks after idle period.
-      // Latch: once triggered, never revert — prevents oscillation.
-      const idleConfig = this.config.getClearContextOnIdle();
-      const thinkingThresholdMin = idleConfig.thinkingThresholdMinutes ?? 5;
-      if (
-        thinkingThresholdMin >= 0 &&
-        !this.thinkingClearLatched &&
-        this.lastApiCompletionTimestamp !== null
-      ) {
-        const thresholdMs = thinkingThresholdMin * 60 * 1000;
-        const idleMs = Date.now() - this.lastApiCompletionTimestamp;
-        if (idleMs > thresholdMs) {
-          this.thinkingClearLatched = true;
-          debugLogger.debug(
-            `Thinking clear latched: idle ${Math.round(idleMs / 1000)}s > threshold ${thresholdMs / 1000}s`,
-          );
-        }
-      }
-      if (this.thinkingClearLatched) {
-        this.getChat().stripThoughtsFromHistoryKeepRecent(1);
-        debugLogger.debug('Stripped old thinking blocks (keeping last 1 turn)');
-      }
-
       // Idle cleanup: clear old tool results when idle > threshold.
       // Runs on user and cron messages (not tool result submissions or
       // retries/hooks) so that model latency during a tool-call loop
@@ -883,7 +848,11 @@ export class GeminiClient {
     for await (const event of resultStream) {
       if (!this.config.getSkipLoopDetection()) {
         if (this.loopDetector.addAndCheck(event)) {
-          yield { type: GeminiEventType.LoopDetected };
+          const loopType = this.loopDetector.getLastLoopType();
+          yield {
+            type: GeminiEventType.LoopDetected,
+            ...(loopType && { value: { loopType } }),
+          };
           if (arenaAgentClient) {
             await arenaAgentClient.reportError('Loop detected');
           }
@@ -1133,6 +1102,13 @@ export class GeminiClient {
       };
       const result = await retryWithBackoff(apiCall, {
         authType: this.config.getContentGeneratorConfig()?.authType,
+        persistentMode: isUnattendedMode(),
+        signal: abortSignal,
+        heartbeatFn: (info) => {
+          process.stderr.write(
+            `[qwen-code] Waiting for API capacity... attempt ${info.attempt}, retry in ${Math.ceil(info.remainingMs / 1000)}s\n`,
+          );
+        },
       });
       return result;
     } catch (error: unknown) {
@@ -1183,6 +1159,14 @@ export class GeminiClient {
         });
 
         await this.startChat(newHistory);
+        // Compaction rewrites the prompt history: prior full-Read tool
+        // results may have been summarised away, but the FileReadCache
+        // still believes those reads are "in this conversation". A
+        // follow-up Read could then return the file_unchanged
+        // placeholder pointing at content the model can no longer
+        // retrieve from its own context. Clear the cache so post-
+        // compaction Reads re-emit the bytes.
+        this.config.getFileReadCache().clear();
         uiTelemetryService.setLastPromptTokenCount(info.newTokenCount);
         this.forceFullIdeContext = true;
       }

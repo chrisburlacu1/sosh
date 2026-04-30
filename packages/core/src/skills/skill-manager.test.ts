@@ -82,6 +82,13 @@ describe('SkillManager', () => {
           allowedTools: ['read_file', 'write_file'],
         };
       }
+      if (yamlString.includes('argument-hint:')) {
+        return {
+          name: 'test-skill',
+          description: 'A test skill',
+          'argument-hint': '[topic]',
+        };
+      }
       if (yamlString.includes('name: skill1')) {
         return { name: 'skill1', description: 'First skill' };
       }
@@ -237,6 +244,25 @@ You are a helpful assistant with this skill.
       );
 
       expect(config.allowedTools).toEqual(['read_file', 'write_file']);
+    });
+
+    it('should parse argument-hint from frontmatter', () => {
+      const markdownWithArgumentHint = `---
+name: test-skill
+description: A test skill
+argument-hint: "[topic]"
+---
+
+Skill body.
+`;
+
+      const config = manager.parseSkillContent(
+        markdownWithArgumentHint,
+        validSkillConfig.filePath,
+        'project',
+      );
+
+      expect(config.argumentHint).toBe('[topic]');
     });
 
     it('should determine level from file path', () => {
@@ -738,6 +764,16 @@ Review content`);
       const reviewSkills = skills.filter((s) => s.name === 'review');
       expect(reviewSkills).toHaveLength(1);
       expect(reviewSkills[0].level).toBe('user');
+    });
+
+    it('should skip all skills in bare mode', async () => {
+      vi.spyOn(mockConfig, 'getBareMode').mockReturnValue(true);
+      mockReaddirForLevels(new Set(['project', 'user', 'bundled']));
+      setupReviewSkillMocks();
+
+      const skills = await manager.listSkills({ force: true });
+
+      expect(skills).toEqual([]);
     });
 
     it('should fall back to bundled level in loadSkill', async () => {

@@ -8,7 +8,17 @@ import { render } from 'ink-testing-library';
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { ModelStatsDisplay } from './ModelStatsDisplay.js';
 import * as SessionContext from '../contexts/SessionContext.js';
-import type { SessionMetrics } from '../contexts/SessionContext.js';
+import type {
+  ModelMetrics,
+  ModelMetricsCore,
+  SessionMetrics,
+} from '../contexts/SessionContext.js';
+import { MAIN_SOURCE } from '@qwen-code/qwen-code-core';
+
+const mainOnly = (core: ModelMetricsCore): ModelMetrics => ({
+  ...core,
+  bySource: { [MAIN_SOURCE]: core },
+});
 
 // Mock the context to provide controlled data for testing
 vi.mock('../contexts/SessionContext.js', async (importOriginal) => {
@@ -73,7 +83,7 @@ describe('<ModelStatsDisplay />', () => {
   it('should not display conditional rows if no model has data for them', () => {
     const { lastFrame } = renderWithMockedStats({
       models: {
-        'gemini-2.5-pro': {
+        'gemini-2.5-pro': mainOnly({
           api: { totalRequests: 1, totalErrors: 0, totalLatencyMs: 100 },
           tokens: {
             prompt: 10,
@@ -81,9 +91,8 @@ describe('<ModelStatsDisplay />', () => {
             total: 30,
             cached: 0,
             thoughts: 0,
-            tool: 0,
           },
-        },
+        }),
       },
       tools: {
         totalCalls: 0,
@@ -98,14 +107,13 @@ describe('<ModelStatsDisplay />', () => {
     const output = lastFrame();
     expect(output).not.toContain('Cached');
     expect(output).not.toContain('Thoughts');
-    expect(output).not.toContain('Tool');
     expect(output).toMatchSnapshot();
   });
 
   it('should display conditional rows if at least one model has data', () => {
     const { lastFrame } = renderWithMockedStats({
       models: {
-        'gemini-2.5-pro': {
+        'gemini-2.5-pro': mainOnly({
           api: { totalRequests: 1, totalErrors: 0, totalLatencyMs: 100 },
           tokens: {
             prompt: 10,
@@ -113,10 +121,9 @@ describe('<ModelStatsDisplay />', () => {
             total: 30,
             cached: 5,
             thoughts: 2,
-            tool: 0,
           },
-        },
-        'gemini-2.5-flash': {
+        }),
+        'gemini-2.5-flash': mainOnly({
           api: { totalRequests: 1, totalErrors: 0, totalLatencyMs: 50 },
           tokens: {
             prompt: 5,
@@ -124,9 +131,8 @@ describe('<ModelStatsDisplay />', () => {
             total: 15,
             cached: 0,
             thoughts: 0,
-            tool: 3,
           },
-        },
+        }),
       },
       tools: {
         totalCalls: 0,
@@ -141,14 +147,13 @@ describe('<ModelStatsDisplay />', () => {
     const output = lastFrame();
     expect(output).toContain('Cached');
     expect(output).toContain('Thoughts');
-    expect(output).toContain('Tool');
     expect(output).toMatchSnapshot();
   });
 
   it('should display stats for multiple models correctly', () => {
     const { lastFrame } = renderWithMockedStats({
       models: {
-        'gemini-2.5-pro': {
+        'gemini-2.5-pro': mainOnly({
           api: { totalRequests: 10, totalErrors: 1, totalLatencyMs: 1000 },
           tokens: {
             prompt: 100,
@@ -156,10 +161,9 @@ describe('<ModelStatsDisplay />', () => {
             total: 300,
             cached: 50,
             thoughts: 10,
-            tool: 5,
           },
-        },
-        'gemini-2.5-flash': {
+        }),
+        'gemini-2.5-flash': mainOnly({
           api: { totalRequests: 20, totalErrors: 2, totalLatencyMs: 500 },
           tokens: {
             prompt: 200,
@@ -167,9 +171,8 @@ describe('<ModelStatsDisplay />', () => {
             total: 600,
             cached: 100,
             thoughts: 20,
-            tool: 10,
           },
-        },
+        }),
       },
       tools: {
         totalCalls: 0,
@@ -190,7 +193,7 @@ describe('<ModelStatsDisplay />', () => {
   it('should handle large values without wrapping or overlapping', () => {
     const { lastFrame } = renderWithMockedStats({
       models: {
-        'gemini-2.5-pro': {
+        'gemini-2.5-pro': mainOnly({
           api: {
             totalRequests: 999999999,
             totalErrors: 123456789,
@@ -202,9 +205,8 @@ describe('<ModelStatsDisplay />', () => {
             total: 999999999,
             cached: 123456789,
             thoughts: 111111111,
-            tool: 222222222,
           },
-        },
+        }),
       },
       tools: {
         totalCalls: 0,
@@ -222,7 +224,7 @@ describe('<ModelStatsDisplay />', () => {
   it('should display a single model correctly', () => {
     const { lastFrame } = renderWithMockedStats({
       models: {
-        'gemini-2.5-pro': {
+        'gemini-2.5-pro': mainOnly({
           api: { totalRequests: 1, totalErrors: 0, totalLatencyMs: 100 },
           tokens: {
             prompt: 10,
@@ -230,9 +232,8 @@ describe('<ModelStatsDisplay />', () => {
             total: 30,
             cached: 5,
             thoughts: 2,
-            tool: 1,
           },
-        },
+        }),
       },
       tools: {
         totalCalls: 0,
@@ -248,5 +249,69 @@ describe('<ModelStatsDisplay />', () => {
     expect(output).toContain('gemini-2.5-pro');
     expect(output).not.toContain('gemini-2.5-flash');
     expect(output).toMatchSnapshot();
+  });
+
+  describe('Subagent source attribution', () => {
+    const baseTools: SessionMetrics['tools'] = {
+      totalCalls: 0,
+      totalSuccess: 0,
+      totalFail: 0,
+      totalDurationMs: 0,
+      totalDecisions: { accept: 0, reject: 0, modify: 0 },
+      byName: {},
+    };
+    const baseFiles: SessionMetrics['files'] = {
+      totalLinesAdded: 0,
+      totalLinesRemoved: 0,
+    };
+    const makeCore = (reqs: number): ModelMetricsCore => ({
+      api: { totalRequests: reqs, totalErrors: 0, totalLatencyMs: 100 },
+      tokens: {
+        prompt: 10,
+        candidates: 20,
+        total: 30,
+        cached: 0,
+        thoughts: 0,
+      },
+    });
+
+    it('collapses the column header when only main is a source', () => {
+      const { lastFrame } = renderWithMockedStats({
+        models: { 'glm-5': mainOnly(makeCore(1)) },
+        tools: baseTools,
+        files: baseFiles,
+      });
+      const output = lastFrame();
+      expect(output).toContain('glm-5');
+      expect(output).not.toContain('glm-5 (main)');
+    });
+
+    it('renders distinct columns for main and subagent when same model has multiple sources', () => {
+      const mainCore = makeCore(1);
+      const echoerCore = makeCore(1);
+      const { lastFrame } = renderWithMockedStats({
+        models: {
+          'glm-5': {
+            api: { totalRequests: 2, totalErrors: 0, totalLatencyMs: 200 },
+            tokens: {
+              prompt: 20,
+              candidates: 40,
+              total: 60,
+              cached: 0,
+              thoughts: 0,
+            },
+            bySource: {
+              [MAIN_SOURCE]: mainCore,
+              echoer: echoerCore,
+            },
+          },
+        },
+        tools: baseTools,
+        files: baseFiles,
+      });
+      const output = lastFrame();
+      expect(output).toContain('glm-5 (main)');
+      expect(output).toContain('glm-5 (echoer)');
+    });
   });
 });

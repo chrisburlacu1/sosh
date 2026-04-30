@@ -37,8 +37,6 @@ import {
   readManyFiles,
   Storage,
   ToolNames,
-  buildPermissionCheckContext,
-  evaluatePermissionRules,
   fireNotificationHook,
   firePermissionRequestHook,
   firePreToolUseHook,
@@ -50,6 +48,12 @@ import {
   createHookOutput,
   generateToolUseId,
   MessageBusType,
+  getPlanModeSystemReminder,
+  getSubagentSystemReminder,
+  getArenaSystemReminder,
+  evaluatePermissionFlow,
+  needsConfirmation,
+  isPlanModeBlocked,
 } from '@qwen-code/qwen-code-core';
 
 import { RequestError } from '@agentclientprotocol/sdk';
@@ -78,6 +82,7 @@ import {
   type NonInteractiveSlashCommandResult,
 } from '../../nonInteractiveCliCommands.js';
 import { isSlashCommand } from '../../ui/utils/commandUtils.js';
+import { CommandKind } from '../../ui/commands/types.js';
 import { parseAcpModelOption } from '../../utils/acpModelUtils.js';
 import { classifyApiError } from '../../ui/hooks/useGeminiStream.js';
 
@@ -144,7 +149,6 @@ export class Session implements SessionContext {
 
   constructor(
     id: string,
-    private readonly chat: GeminiChat,
     readonly config: Config,
     private readonly client: AgentSideConnection,
     private readonly settings: LoadedSettings,
@@ -291,7 +295,9 @@ export class Session implements SessionContext {
         // Increment turn counter for each user prompt
         this.turn += 1;
 
-        const chat = this.chat;
+        // Always fetch the current chat from GeminiClient so that /clear's
+        // resetChat() (which replaces the chat instance) is reflected here.
+        const chat = this.config.getGeminiClient()!.getChat();
         const promptId = this.config.getSessionId() + '########' + this.turn;
 
         // Extract text from all text blocks to construct the full prompt text for logging
@@ -324,7 +330,7 @@ export class Session implements SessionContext {
         let parts: Part[] | null;
 
         if (isSlashCommand(inputText)) {
-          // Handle slash command - uses default allowed commands (init, summary, compress)
+          // Handle slash command in ACP mode using capability-based filtering
           const slashCommandResult = await handleSlashCommand(
             inputText,
             pendingSend,
@@ -391,6 +397,16 @@ export class Session implements SessionContext {
           if (additionalContext) {
             parts = [...parts, { text: additionalContext }];
           }
+        }
+
+        // Prepend session-level system reminders (plan mode / subagent /
+        // arena) so the model sees them, matching the behaviour of
+        // `GeminiClient.sendMessageStream` in the CLI/TUI path. Without this,
+        // plan mode in ACP has no effect because the model never learns it
+        // should avoid edits (#1151).
+        const systemReminders = await this.#buildInitialSystemReminders();
+        if (systemReminders.length > 0) {
+          parts = [...systemReminders, ...parts];
         }
 
         let nextMessage: Content | null = { role: 'user', parts };
@@ -508,17 +524,11 @@ export class Session implements SessionContext {
           }
 
           if (functionCalls.length > 0) {
-            const toolResponseParts: Part[] = [];
-
-            for (const fc of functionCalls) {
-              const response = await this.runTool(
-                pendingSend.signal,
-                promptId,
-                fc,
-              );
-              toolResponseParts.push(...response);
-            }
-
+            const toolResponseParts = await this.runToolCalls(
+              pendingSend.signal,
+              promptId,
+              functionCalls,
+            );
             nextMessage = { role: 'user', parts: toolResponseParts };
           }
         }
@@ -578,12 +588,12 @@ export class Session implements SessionContext {
       // Get response text from the chat history
       const history = chat.getHistory();
       const lastModelMessage = history
-        .filter((msg) => msg.role === 'model')
+        .filter((msg: Content) => msg.role === 'model')
         .pop();
       const responseText =
         lastModelMessage?.parts
-          ?.filter((p): p is { text: string } => 'text' in p)
-          .map((p) => p.text)
+          ?.filter((p: Part): p is { text: string } & Part => 'text' in p)
+          .map((p: { text: string }) => p.text)
           .join('') || '[no response text]';
 
       const response = await messageBus.request<
@@ -749,17 +759,11 @@ export class Session implements SessionContext {
 
           // Process tool calls from the follow-up message
           if (functionCalls.length > 0) {
-            const toolResponseParts: Part[] = [];
-
-            for (const fc of functionCalls) {
-              const toolResponse = await this.runTool(
-                pendingSend.signal,
-                promptId,
-                fc,
-              );
-              toolResponseParts.push(...toolResponse);
-            }
-
+            const toolResponseParts = await this.runToolCalls(
+              pendingSend.signal,
+              promptId,
+              functionCalls,
+            );
             nextMessage = { role: 'user', parts: toolResponseParts };
           }
         }
@@ -865,9 +869,12 @@ export class Session implements SessionContext {
             _meta: { source: 'cron' },
           });
 
+          // Prepend session-level system reminders (same rationale as the
+          // user-query path in #executePrompt).
+          const cronReminders = await this.#buildInitialSystemReminders();
           let nextMessage: Content | null = {
             role: 'user',
-            parts: [{ text: prompt }],
+            parts: [...cronReminders, { text: prompt }],
           };
 
           while (nextMessage !== null) {
@@ -878,14 +885,17 @@ export class Session implements SessionContext {
               null;
             const streamStartTime = Date.now();
 
-            const responseStream = await this.chat.sendMessageStream(
-              this.config.getModel(),
-              {
-                message: nextMessage.parts ?? [],
-                config: { abortSignal: ac.signal },
-              },
-              promptId,
-            );
+            const responseStream = await this.config
+              .getGeminiClient()!
+              .getChat()
+              .sendMessageStream(
+                this.config.getModel(),
+                {
+                  message: nextMessage.parts ?? [],
+                  config: { abortSignal: ac.signal },
+                },
+                promptId,
+              );
             nextMessage = null;
 
             for await (const resp of responseStream) {
@@ -936,11 +946,11 @@ export class Session implements SessionContext {
             }
 
             if (functionCalls.length > 0) {
-              const toolResponseParts: Part[] = [];
-              for (const fc of functionCalls) {
-                const response = await this.runTool(ac.signal, promptId, fc);
-                toolResponseParts.push(...response);
-              }
+              const toolResponseParts = await this.runToolCalls(
+                ac.signal,
+                promptId,
+                functionCalls,
+              );
               nextMessage = { role: 'user', parts: toolResponseParts };
             }
           }
@@ -961,24 +971,57 @@ export class Session implements SessionContext {
   async sendAvailableCommandsUpdate(): Promise<void> {
     const abortController = new AbortController();
     try {
-      // Use default allowed commands from getAvailableCommands
+      // Load commands available in ACP mode
       const slashCommands = await getAvailableCommands(
         this.config,
         abortController.signal,
+        'acp',
       );
 
-      // Convert SlashCommand[] to AvailableCommand[] format for ACP protocol
-      const availableCommands: AvailableCommand[] = slashCommands.map(
-        (cmd) => ({
+      // Convert SlashCommand[] to AvailableCommand[] format for ACP protocol.
+      // Commands that accept arguments get input: { hint } so the client can
+      // let users type arguments before submitting.  Commands with no argument
+      // support get input: null so the client auto-submits them on selection.
+      //
+      // A command is considered to accept arguments when any of:
+      //   - it is not a BUILT_IN command (skills, file commands, etc.)
+      //   - it has a completion function
+      //   - it declares an argumentHint
+      //   - it has subCommands
+      const availableCommands: AvailableCommand[] = slashCommands.map((cmd) => {
+        const acceptsInput =
+          cmd.kind !== CommandKind.BUILT_IN ||
+          cmd.completion != null ||
+          cmd.argumentHint != null ||
+          (cmd.subCommands != null && cmd.subCommands.length > 0);
+        return {
           name: cmd.name,
           description: cmd.description,
-          input: null,
-        }),
-      );
+          input: acceptsInput ? { hint: cmd.argumentHint ?? '' } : null,
+        };
+      });
+
+      let availableSkills: string[] | undefined;
+      try {
+        const skillManager = this.config.getSkillManager();
+        if (skillManager) {
+          const skills = await skillManager.listSkills();
+          availableSkills = skills.map((skill) => skill.name);
+        }
+      } catch (error) {
+        debugLogger.error('Error loading available skills:', error);
+      }
 
       const update: SessionUpdate = {
         sessionUpdate: 'available_commands_update',
         availableCommands,
+        ...(availableSkills
+          ? {
+              _meta: {
+                availableSkills,
+              },
+            }
+          : {}),
       };
 
       await this.sendUpdate(update);
@@ -1082,6 +1125,124 @@ export class Session implements SessionContext {
     await this.sendUpdate(update);
   }
 
+  /**
+   * Execute a batch of model-returned tool calls, running Agent calls
+   * concurrently while keeping other tools sequential.
+   *
+   * Mirrors the partition logic in `coreToolScheduler.partitionToolCalls`:
+   * consecutive Agent calls form a parallel batch (they spawn independent
+   * sub-agents with no shared mutable state); any other tool forms its own
+   * sequential batch to preserve the implicit ordering the model may rely
+   * on. Response-part ordering matches the original `functionCalls` order.
+   */
+  private async runToolCalls(
+    abortSignal: AbortSignal,
+    promptId: string,
+    functionCalls: FunctionCall[],
+  ): Promise<Part[]> {
+    type Batch = { concurrent: boolean; calls: FunctionCall[] };
+    const batches: Batch[] = [];
+    for (const fc of functionCalls) {
+      const isAgent = fc.name === ToolNames.AGENT;
+      const last = batches[batches.length - 1];
+      if (isAgent && last?.concurrent) {
+        last.calls.push(fc);
+      } else {
+        batches.push({ concurrent: isAgent, calls: [fc] });
+      }
+    }
+
+    // Bounded-concurrency runner: matches core's `runConcurrently`
+    // behaviour (`coreToolScheduler.ts:1506`), capped by
+    // `QWEN_CODE_MAX_TOOL_CONCURRENCY` (default 10). Results are returned
+    // in input order regardless of resolution order.
+    const runBounded = async (calls: FunctionCall[]): Promise<Part[][]> => {
+      const parsed = parseInt(
+        process.env['QWEN_CODE_MAX_TOOL_CONCURRENCY'] || '',
+        10,
+      );
+      const maxConcurrency =
+        Number.isFinite(parsed) && parsed >= 1 ? parsed : 10;
+      const results: Part[][] = new Array(calls.length);
+      const executing = new Set<Promise<void>>();
+      for (let i = 0; i < calls.length; i++) {
+        const idx = i;
+        const p = this.runTool(abortSignal, promptId, calls[idx])
+          .then((r) => {
+            results[idx] = r;
+          })
+          .finally(() => {
+            executing.delete(p);
+          });
+        executing.add(p);
+        if (executing.size >= maxConcurrency) {
+          await Promise.race(executing);
+        }
+      }
+      await Promise.all(executing);
+      return results;
+    };
+
+    const parts: Part[] = [];
+    for (const batch of batches) {
+      if (batch.concurrent && batch.calls.length > 1) {
+        const results = await runBounded(batch.calls);
+        for (const r of results) parts.push(...r);
+      } else {
+        for (const fc of batch.calls) {
+          const r = await this.runTool(abortSignal, promptId, fc);
+          parts.push(...r);
+        }
+      }
+    }
+    return parts;
+  }
+
+  /**
+   * Assemble the per-turn system reminders the model needs to see at the
+   * start of a user query or cron fire. Mirrors the subagent/plan/arena
+   * branches in `GeminiClient.sendMessageStream` (`client.ts:848-878`) —
+   * the ACP path bypasses that code, so without this helper plan mode is
+   * silently inert (#1151) and subagent/arena sessions lose context.
+   *
+   * Scope note: the `relevantAutoMemory` reminder is intentionally NOT
+   * included here. Managed auto-memory requires a prefetch pipeline that
+   * lives in `GeminiClient`, and porting it into the ACP path is tracked
+   * separately as part of the broader middleware-alignment work.
+   */
+  async #buildInitialSystemReminders(): Promise<Part[]> {
+    const reminders: Part[] = [];
+
+    const hasAgentTool = await this.config
+      .getToolRegistry()
+      .ensureTool(ToolNames.AGENT);
+    const subagents = (await this.config.getSubagentManager().listSubagents())
+      .filter((subagent) => subagent.level !== 'builtin')
+      .map((subagent) => subagent.name);
+    if (hasAgentTool && subagents.length > 0) {
+      reminders.push({ text: getSubagentSystemReminder(subagents) });
+    }
+
+    if (this.config.getApprovalMode() === ApprovalMode.PLAN) {
+      reminders.push({
+        text: getPlanModeSystemReminder(this.config.getSdkMode?.()),
+      });
+    }
+
+    const arenaManager = this.config.getArenaManager?.();
+    if (arenaManager) {
+      try {
+        const sessionDir = arenaManager.getArenaSessionDir();
+        const configPath = `${sessionDir}/config.json`;
+        reminders.push({ text: getArenaSystemReminder(configPath) });
+      } catch {
+        // Arena config not yet initialized — skip (matches client.ts).
+      }
+    }
+
+    return reminders;
+  }
+
   private async runTool(
     abortSignal: AbortSignal,
     promptId: string,
@@ -1181,14 +1342,19 @@ export class Session implements SessionContext {
     try {
       const invocation = tool.build(args);
 
-      if (isAgentTool && 'eventEmitter' in invocation) {
-        // Access eventEmitter from AgentTool invocation
-        const taskEventEmitter = (
-          invocation as {
-            eventEmitter: AgentEventEmitter;
-          }
-        ).eventEmitter;
-
+      // Production AgentTool always initializes `eventEmitter` on its
+      // invocation (`agent.ts:392`). Be defensive about the `undefined`
+      // case too so an incomplete/custom AgentTool invocation degrades
+      // gracefully (no sub-agent event forwarding) instead of throwing
+      // inside SubAgentTracker.setup — the `'eventEmitter' in invocation`
+      // key-presence check passed for `{ eventEmitter: undefined }` and
+      // the ensuing `eventEmitter.on(...)` blew up.
+      const taskEventEmitter = (
+        invocation as {
+          eventEmitter?: AgentEventEmitter;
+        }
+      ).eventEmitter;
+      if (isAgentTool && taskEventEmitter) {
         // Extract subagent metadata from AgentTool call
         const parentToolCallId = callId;
         const subagentType = (args['subagent_type'] as string) ?? '';
@@ -1218,39 +1384,22 @@ export class Session implements SessionContext {
       // The VS Code extension is just a UI layer for requestPermission.
       const isAskUserQuestionTool = fc.name === ToolNames.ASK_USER_QUESTION;
 
-      // ---- L3: Tool's default permission ----
-      // In YOLO mode, force 'allow' for everything except ask_user_question.
-      const defaultPermission =
-        this.config.getApprovalMode() !== ApprovalMode.YOLO ||
-        isAskUserQuestionTool
-          ? await invocation.getDefaultPermission()
-          : 'allow';
-
-      // ---- L4: PermissionManager override (if relevant rules exist) ----
+      // ---- L3→L4: Shared permission flow ----
       const toolParams = invocation.params as Record<string, unknown>;
-      const pmCtx = buildPermissionCheckContext(
+      const flowResult = await evaluatePermissionFlow(
+        this.config,
+        invocation,
         fc.name,
         toolParams,
-        this.config.getTargetDir?.() ?? '',
       );
-      const { finalPermission, pmForcedAsk } = await evaluatePermissionRules(
-        pm,
-        defaultPermission,
-        pmCtx,
-      );
-
-      const needsConfirmation = finalPermission === 'ask';
+      const { finalPermission, pmForcedAsk, pmCtx, denyMessage } = flowResult;
 
       // ---- L5: ApprovalMode overrides ----
       const isPlanMode = approvalMode === ApprovalMode.PLAN;
 
       if (finalPermission === 'deny') {
         return earlyErrorResponse(
-          new Error(
-            defaultPermission === 'deny'
-              ? `Tool "${fc.name}" is denied: command substitution is not allowed for security reasons.`
-              : `Tool "${fc.name}" is denied by permission rules.`,
-          ),
+          new Error(denyMessage ?? `Tool "${fc.name}" is denied.`),
           fc.name,
         );
       }
@@ -1258,7 +1407,7 @@ export class Session implements SessionContext {
       let didRequestPermission = false;
       let confirmationDetails: ToolCallConfirmationDetails | undefined;
 
-      if (needsConfirmation) {
+      if (needsConfirmation(finalPermission, approvalMode, fc.name)) {
         confirmationDetails =
           await invocation.getConfirmationDetails(abortSignal);
 
@@ -1266,10 +1415,12 @@ export class Session implements SessionContext {
         injectPermissionRulesIfMissing(confirmationDetails, pmCtx);
 
         if (
-          isPlanMode &&
-          !isExitPlanModeTool &&
-          !isAskUserQuestionTool &&
-          confirmationDetails.type !== 'info'
+          isPlanModeBlocked(
+            isPlanMode,
+            isExitPlanModeTool,
+            isAskUserQuestionTool,
+            confirmationDetails,
+          )
         ) {
           return earlyErrorResponse(
             new Error(
@@ -1690,44 +1841,59 @@ export class Session implements SessionContext {
         return normalizePartList(result.content);
 
       case 'message': {
-        await this.client.extNotification('_qwencode/slash_command', {
-          sessionId: this.sessionId,
-          command: originalPrompt
-            .filter((block) => block.type === 'text')
-            .map((block) => (block.type === 'text' ? block.text : ''))
-            .join(' '),
-          messageType: result.messageType,
-          message: result.content || '',
-        });
-
         if (result.messageType === 'error') {
           // Throw error to stop execution
           throw new Error(result.content || 'Slash command failed.');
         }
-        // For info messages, return null to indicate command was handled
+        // Emit the message as an agent message chunk so Zed renders it in the
+        // chat UI. extNotification only goes to the ACP debug log and is not
+        // rendered by Zed.
+        // Replace bare \n with Markdown hard line-breaks (two trailing spaces)
+        // so Zed's Markdown renderer preserves the line structure.
+        const rendered = (result.content || '').replace(/\n/g, '  \n');
+        await this.messageEmitter.emitAgentMessage(rendered);
+        // Write a system/slash_command record so history replay on restart can
+        // re-emit this message. system records are skipped by
+        // buildApiHistoryFromConversation, so this won't pollute model context.
+        this.config.getChatRecordingService()?.recordSlashCommand({
+          phase: 'result',
+          rawCommand: originalPrompt
+            .filter((b) => b.type === 'text')
+            .map((b) => (b.type === 'text' ? b.text : ''))
+            .join(' '),
+          outputHistoryItems: [
+            { type: 'assistant', text: result.content || '' },
+          ],
+        });
         return null;
       }
 
       case 'stream_messages': {
         // Command returns multiple messages via async generator (ACP-preferred)
-        const command = originalPrompt
-          .filter((block) => block.type === 'text')
-          .map((block) => (block.type === 'text' ? block.text : ''))
-          .join(' ');
-
-        // Stream all messages to the client
+        // Stream all messages to the client as agent message chunks.
+        const chunks: string[] = [];
         for await (const msg of result.messages) {
-          await this.client.extNotification('_qwencode/slash_command', {
-            sessionId: this.sessionId,
-            command,
-            messageType: msg.messageType,
-            message: msg.content,
-          });
-
-          // If we encounter an error message, throw after sending
           if (msg.messageType === 'error') {
             throw new Error(msg.content || 'Slash command failed.');
           }
+          await this.messageEmitter.emitAgentMessage(
+            (msg.content || '').replace(/\n/g, '  \n'),
+          );
+          chunks.push(msg.content || '');
+        }
+        // Write a system/slash_command record for history replay (same reason as
+        // 'message' case — system records are invisible to model history).
+        if (chunks.length > 0) {
+          this.config.getChatRecordingService()?.recordSlashCommand({
+            phase: 'result',
+            rawCommand: originalPrompt
+              .filter((b) => b.type === 'text')
+              .map((b) => (b.type === 'text' ? b.text : ''))
+              .join(' '),
+            outputHistoryItems: [
+              { type: 'assistant', text: chunks.join('\n') },
+            ],
+          });
         }
 
         // All messages sent successfully, return null to indicate command was handled

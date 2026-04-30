@@ -5,7 +5,7 @@
  */
 
 import type {
-  BackgroundAgentStatus,
+  BackgroundTaskStatus,
   Config,
   ToolCallRequestInfo,
 } from '@qwen-code/qwen-code-core';
@@ -20,6 +20,7 @@ import {
   promptIdContext,
   OutputFormat,
   InputFormat,
+  LoopType,
   uiTelemetryService,
   parseAndFormatApiError,
   createDebugLogger,
@@ -50,6 +51,38 @@ import {
   createAgentToolProgressHandler,
   computeUsageFromMetrics,
 } from './utils/nonInteractiveHelpers.js';
+
+// Human-readable labels for the detectors that can fire mid-stream.
+// Surfaced to stderr in TEXT mode so a headless run that halts on a loop
+// doesn't exit with empty stdout and no explanation — see PR #3236 review.
+const LOOP_TYPE_LABELS: Record<LoopType, string> = {
+  [LoopType.CONSECUTIVE_IDENTICAL_TOOL_CALLS]:
+    'the model repeated the same tool call with identical arguments',
+  [LoopType.CHANTING_IDENTICAL_SENTENCES]:
+    'the model repeated the same sentence in its output',
+  [LoopType.REPETITIVE_THOUGHTS]:
+    'the model repeated the same reasoning thought',
+  [LoopType.READ_FILE_LOOP]:
+    'the model spent too many consecutive calls reading files without making progress',
+  [LoopType.ACTION_STAGNATION]:
+    'the model kept calling the same tool without making progress',
+};
+
+function emitLoopDetectedMessage(
+  config: Config,
+  loopType: LoopType | undefined,
+): void {
+  // In TEXT mode the adapter swallows LoopDetected, so we print here. In
+  // JSON modes the adapter emits a structured result, which is enough.
+  if (config.getOutputFormat() !== OutputFormat.TEXT) {
+    return;
+  }
+  const reason = loopType ? LOOP_TYPE_LABELS[loopType] : undefined;
+  const detail = reason ? ` (${loopType}: ${reason})` : '';
+  process.stderr.write(
+    `Loop detection halted the run${detail}. Set the \`model.skipLoopDetection\` setting to true to disable.\n`,
+  );
+}
 
 /**
  * Emits a final message for slash command results.
@@ -142,15 +175,21 @@ export async function runNonInteractive(
     let totalApiDurationMs = 0;
     const startTime = Date.now();
 
-    const stdoutErrorHandler = (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EPIPE') {
-        process.stdout.removeListener('error', stdoutErrorHandler);
-        process.exit(0);
-      }
-    };
-
     const geminiClient = config.getGeminiClient();
     const abortController = options.abortController ?? new AbortController();
+
+    // EPIPE: don't process.exit here — that bypasses the caller's
+    // runExitCleanup → flush() and drops queued JSONL writes. Destroy
+    // stdout instead and let the natural return drive cleanup. (Aborting
+    // is also wrong: the abort path runs handleCancellationError → exit
+    // 130 and re-introduces the same bypass.)
+    let pipeBroken = false;
+    const stdoutErrorHandler = (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EPIPE' && !pipeBroken) {
+        pipeBroken = true;
+        process.stdout.destroy();
+      }
+    };
 
     // Setup signal handlers for graceful shutdown
     const shutdownHandler = () => {
@@ -263,7 +302,7 @@ export async function runNonInteractive(
         sdkNotification?: {
           task_id: string;
           tool_use_id?: string;
-          status: BackgroundAgentStatus;
+          status: BackgroundTaskStatus;
           usage?: {
             total_tokens: number;
             tool_uses: number;
@@ -310,7 +349,7 @@ export async function runNonInteractive(
           config.getMaxSessionTurns() >= 0 &&
           turnCount > config.getMaxSessionTurns()
         ) {
-          handleMaxTurnsExceededError(config);
+          await handleMaxTurnsExceededError(config);
         }
 
         const toolCallRequests: ToolCallRequestInfo[] = [];
@@ -333,12 +372,15 @@ export async function runNonInteractive(
 
         for await (const event of responseStream) {
           if (abortController.signal.aborted) {
-            handleCancellationError(config);
+            await handleCancellationError(config);
           }
           // Use adapter for all event processing
           adapter.processEvent(event);
           if (event.type === GeminiEventType.ToolCallRequest) {
             toolCallRequests.push(event.value);
+          }
+          if (event.type === GeminiEventType.LoopDetected) {
+            emitLoopDetectedMessage(config, event.value?.loopType);
           }
           if (
             outputFormat === OutputFormat.TEXT &&
@@ -456,7 +498,7 @@ export async function runNonInteractive(
               config.getMaxSessionTurns() >= 0 &&
               turnCount > config.getMaxSessionTurns()
             ) {
-              handleMaxTurnsExceededError(config);
+              await handleMaxTurnsExceededError(config);
             }
 
             const inputFormat =
@@ -505,6 +547,9 @@ export async function runNonInteractive(
                 adapter.processEvent(event);
                 if (event.type === GeminiEventType.ToolCallRequest) {
                   itemToolCallRequests.push(event.value);
+                }
+                if (event.type === GeminiEventType.LoopDetected) {
+                  emitLoopDetectedMessage(config, event.value?.loopType);
                 }
                 if (
                   outputFormat === OutputFormat.TEXT &&
@@ -666,11 +711,15 @@ export async function runNonInteractive(
               while (localQueue.length > 0) {
                 emitNotificationToSdk(localQueue.shift()!);
               }
-              handleCancellationError(config);
+              await handleCancellationError(config);
             }
             await drainLocalQueue();
-            const running = registry.getRunning();
-            if (running.length === 0 && localQueue.length === 0) break;
+            // Wait for every task's terminal notification, not just the
+            // running ones: cancel() marks status 'cancelled' synchronously
+            // but the notification is emitted later by the natural handler,
+            // and SDK consumers need every task_started paired with one.
+            if (!registry.hasUnfinalizedTasks() && localQueue.length === 0)
+              break;
             await new Promise((r) => setTimeout(r, 100));
           }
 
@@ -721,7 +770,7 @@ export async function runNonInteractive(
         usage,
         stats,
       });
-      handleError(error, config);
+      await handleError(error, config);
     } finally {
       const reg = config.getBackgroundTaskRegistry();
       reg.setNotificationCallback(undefined);

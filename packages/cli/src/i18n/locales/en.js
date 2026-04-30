@@ -431,6 +431,8 @@ export default {
   'Tool Schema Compliance': 'Tool Schema Compliance',
   // Settings enum options
   'Auto (detect from system)': 'Auto (detect from system)',
+  'Auto (detect terminal theme)': 'Auto (detect terminal theme)',
+  Auto: 'Auto',
   Text: 'Text',
   JSON: 'JSON',
   Plan: 'Plan',
@@ -572,6 +574,8 @@ export default {
   'Updates all extensions or a named extension to the latest version.':
     'Updates all extensions or a named extension to the latest version.',
   'Update all extensions.': 'Update all extensions.',
+  'The name of the extension to update.':
+    'The name of the extension to update.',
   'Either an extension name or --all must be provided':
     'Either an extension name or --all must be provided',
   'Lists installed extensions.': 'Lists installed extensions.',
@@ -723,6 +727,7 @@ export default {
   'User Settings': 'User Settings',
   'System Settings': 'System Settings',
   Extensions: 'Extensions',
+  'Session (temporary)': 'Session (temporary)',
   // Hooks - Status
   '✓ Enabled': '✓ Enabled',
   '✗ Disabled': '✗ Disabled',
@@ -1355,6 +1360,8 @@ export default {
     'Paid \u00B7 Up to 6,000 requests/5 hrs \u00B7 All Alibaba Cloud Coding Plan Models',
   'Alibaba Cloud Coding Plan': 'Alibaba Cloud Coding Plan',
   'Bring your own API key': 'Bring your own API key',
+  'Browser-based authentication with third-party providers (e.g. OpenRouter, ModelScope)':
+    'Browser-based authentication with third-party providers (e.g. OpenRouter, ModelScope)',
   'API-KEY': 'API-KEY',
   'Use coding plan credentials or your own api-keys/providers.':
     'Use coding plan credentials or your own api-keys/providers.',
@@ -1683,6 +1690,7 @@ export default {
   'Command Format Migration': 'Command Format Migration',
   'Found {{count}} TOML command file:': 'Found {{count}} TOML command file:',
   'Found {{count}} TOML command files:': 'Found {{count}} TOML command files:',
+  'Current tasks': 'Current tasks',
   '... and {{count}} more': '... and {{count}} more',
   'The TOML format is deprecated. Would you like to migrate them to Markdown format?':
     'The TOML format is deprecated. Would you like to migrate them to Markdown format?',
@@ -1893,6 +1901,8 @@ export default {
   // Coding Plan Authentication
   // ============================================================================
   'API key cannot be empty.': 'API key cannot be empty.',
+  'Invalid API key. Coding Plan API keys start with "sk-sp-". Please check.':
+    'Invalid API key. Coding Plan API keys start with "sk-sp-". Please check.',
   'You can get your Coding Plan API key here':
     'You can get your Coding Plan API key here',
   'API key is stored in settings.env. You can migrate it to a .env file for better security.':
@@ -1946,6 +1956,11 @@ export default {
   // Context Usage Component
   // ============================================================================
   'Context Usage': 'Context Usage',
+  '% used': '% used',
+  '% context used': '% context used',
+  'Context exceeds limit! Use /compress or /clear to reduce.':
+    'Context exceeds limit! Use /compress or /clear to reduce.',
+  'Use /compress or /clear': 'Use /compress or /clear',
   'No API response yet. Send a message to see actual usage.':
     'No API response yet. Send a message to see actual usage.',
   'Estimated pre-conversation overhead': 'Estimated pre-conversation overhead',
@@ -1965,6 +1980,8 @@ export default {
     'Show context window usage breakdown.',
   'Run /context detail for per-item breakdown.':
     'Run /context detail for per-item breakdown.',
+  'Show context window usage breakdown. Use "/context detail" for per-item breakdown.':
+    'Show context window usage breakdown. Use "/context detail" for per-item breakdown.',
   'body loaded': 'body loaded',
   memory: 'memory',
   '{{region}} configuration updated successfully.':

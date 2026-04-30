@@ -52,11 +52,15 @@ import { CONCURRENCY_SAFE_KINDS } from '../tools/tools.js';
 import { isShellCommandReadOnly } from '../utils/shellReadOnlyChecker.js';
 import { stripShellWrapper } from '../utils/shell-utils.js';
 import {
-  buildPermissionCheckContext,
-  evaluatePermissionRules,
   injectPermissionRulesIfMissing,
   persistPermissionOutcome,
 } from './permission-helpers.js';
+import {
+  evaluatePermissionFlow,
+  needsConfirmation,
+  isPlanModeBlocked,
+  isAutoEditApproved,
+} from './permissionFlow.js';
 import { getResponseTextFromParts } from '../utils/generateContentResponseUtilities.js';
 import type { ModifyContext } from '../tools/modifiable-tool.js';
 import {
@@ -71,20 +75,22 @@ import { IdeClient } from '../ide/ide-client.js';
 
 const TRUNCATION_PARAM_GUIDANCE =
   'Note: Your previous response was truncated due to max_tokens limit, ' +
-  'which likely caused incomplete tool call parameters. ' +
+  'which caused incomplete tool call parameters. ' +
   'Please retry the tool call with complete parameters. ' +
   'If the content is too large for a single response, ' +
-  'consider splitting it into smaller parts.';
+  'you MUST split it into smaller parts: ' +
+  'first write_file with a skeleton/partial content, ' +
+  'then use edit to add the remaining sections incrementally.';
 
 const TRUNCATION_EDIT_REJECTION =
   'Your previous response was truncated due to max_tokens limit, ' +
-  'which likely produced incomplete file content. ' +
+  'which produced incomplete file content. ' +
   'The tool call has been rejected to prevent writing ' +
   'truncated content to the file. ' +
-  'Please retry the tool call with complete content. ' +
-  'If the content is too large for a single response, ' +
-  'consider splitting it into smaller parts ' +
-  '(e.g., write_file for initial content, then edit for additions).';
+  'You MUST split the content into smaller parts: ' +
+  'first write_file with a skeleton/partial content, ' +
+  'then use edit to add the remaining sections incrementally. ' +
+  'Do NOT retry with the same large content.';
 
 export type ValidatingToolCall = {
   status: 'validating';
@@ -129,7 +135,14 @@ export type ExecutingToolCall = {
   tool: AnyDeclarativeTool;
   invocation: AnyToolInvocation;
   liveOutput?: ToolResultDisplay;
+  /** Timestamp when the tool was first scheduled (validating). */
   startTime?: number;
+  /**
+   * Timestamp when the tool actually began executing (after any
+   * approval/scheduling wait). Use this for "how long has this been
+   * running" displays; prefer it over startTime to exclude approval time.
+   */
+  executionStartTime?: number;
   outcome?: ToolConfirmationOutcome;
   pid?: number;
 };
@@ -597,6 +610,7 @@ export class CoreToolScheduler {
             tool: toolInstance,
             status: 'executing',
             startTime: existingStartTime,
+            executionStartTime: Date.now(),
             outcome,
             invocation,
           } as ExecutingToolCall;
@@ -794,20 +808,20 @@ export class CoreToolScheduler {
       }
       const requestsToProcess = Array.isArray(request) ? request : [request];
 
-      // Check if this batch continues a validation retry loop.
-      // Keys are "<toolName>:<errorMessage>"; if no request reuses a tool name
-      // that previously failed validation, reset the tracker.
+      // Prune validation retry state per-tool, not wholesale. Keys are
+      // "<toolName>:<errorMessage>"; retain counters only for tools actually
+      // present in the current batch. Keeping every tracked tool's counters
+      // whenever any current request matched caused stale counts for
+      // unrelated tools to survive and fire RETRY LOOP DETECTED prematurely
+      // the next time those tools were used.
       if (this.validationRetryCounts.size > 0) {
-        const prevTools = new Set<string>();
-        for (const key of this.validationRetryCounts.keys()) {
+        const currentToolNames = new Set(requestsToProcess.map((r) => r.name));
+        for (const key of [...this.validationRetryCounts.keys()]) {
           const sep = key.indexOf(':');
-          prevTools.add(sep === -1 ? key : key.slice(0, sep));
-        }
-        const hasPrevFailingTool = requestsToProcess.some((r) =>
-          prevTools.has(r.name),
-        );
-        if (!hasPrevFailingTool) {
-          this.validationRetryCounts.clear();
+          const toolName = sep === -1 ? key : key.slice(0, sep);
+          if (!currentToolNames.has(toolName)) {
+            this.validationRetryCounts.delete(key);
+          }
         }
       }
 
@@ -880,6 +894,24 @@ export class CoreToolScheduler {
           continue;
         }
 
+        // Reject file-modifying calls when truncated to prevent
+        // writing incomplete content, even if params failed schema validation.
+        if (reqInfo.wasOutputTruncated && toolInstance.kind === Kind.Edit) {
+          const truncationError = new Error(TRUNCATION_EDIT_REJECTION);
+          newToolCalls.push({
+            status: 'error',
+            request: reqInfo,
+            tool: toolInstance,
+            response: createErrorResponse(
+              reqInfo,
+              truncationError,
+              ToolErrorType.OUTPUT_TRUNCATED,
+            ),
+            durationMs: 0,
+          });
+          continue;
+        }
+
         const invocationOrError = this.buildInvocation(
           toolInstance,
           reqInfo.args,
@@ -926,24 +958,6 @@ export class CoreToolScheduler {
         // Reset all validation retry counters for this tool since it passed validation
         this.clearRetryCountsForTool(reqInfo.name);
 
-        // Reject file-modifying calls when truncated to prevent
-        // writing incomplete content.
-        if (reqInfo.wasOutputTruncated && toolInstance.kind === Kind.Edit) {
-          const truncationError = new Error(TRUNCATION_EDIT_REJECTION);
-          newToolCalls.push({
-            status: 'error',
-            request: reqInfo,
-            tool: toolInstance,
-            response: createErrorResponse(
-              reqInfo,
-              truncationError,
-              ToolErrorType.OUTPUT_TRUNCATED,
-            ),
-            durationMs: 0,
-          });
-          continue;
-        }
-
         newToolCalls.push({
           status: 'validating',
           request: reqInfo,
@@ -977,20 +991,16 @@ export class CoreToolScheduler {
           // L3→L4→L5 Permission Flow
           // =================================================================
 
-          // ---- L3: Tool's default permission ----
-          const defaultPermission: string =
-            await invocation.getDefaultPermission();
-
-          // ---- L4: PermissionManager override (if relevant rules exist) ----
-          const pm = this.config.getPermissionManager?.();
+          // ---- L3→L4: Shared permission flow ----
           const toolParams = invocation.params as Record<string, unknown>;
-          const pmCtx = buildPermissionCheckContext(
+          const flowResult = await evaluatePermissionFlow(
+            this.config,
+            invocation,
             reqInfo.name,
             toolParams,
-            this.config.getTargetDir?.() ?? '',
           );
-          const { finalPermission, pmForcedAsk } =
-            await evaluatePermissionRules(pm, defaultPermission, pmCtx);
+          const { finalPermission, pmForcedAsk, pmCtx, denyMessage } =
+            flowResult;
 
           // ---- L5: Final decision based on permission + ApprovalMode ----
           const approvalMode = this.config.getApprovalMode();
@@ -1009,22 +1019,12 @@ export class CoreToolScheduler {
 
           if (finalPermission === 'deny') {
             // Hard deny: security violation or PM explicit deny
-            let denyMessage: string;
-            if (defaultPermission === 'deny') {
-              denyMessage = `Tool "${reqInfo.name}" is denied: command substitution is not allowed for security reasons.`;
-            } else {
-              const matchingRule = pm?.findMatchingDenyRule(pmCtx);
-              const ruleInfo = matchingRule
-                ? ` Matching deny rule: "${matchingRule}".`
-                : '';
-              denyMessage = `Tool "${reqInfo.name}" is denied by permission rules.${ruleInfo}`;
-            }
             this.setStatusInternal(
               reqInfo.callId,
               'error',
               createErrorResponse(
                 reqInfo,
-                new Error(denyMessage),
+                new Error(denyMessage ?? `Tool "${reqInfo.name}" is denied.`),
                 ToolErrorType.EXECUTION_DENIED,
               ),
             );
@@ -1039,7 +1039,7 @@ export class CoreToolScheduler {
             reqInfo.name === ToolNames.ASK_USER_QUESTION;
           let confirmationDetails: ToolCallConfirmationDetails | undefined;
 
-          if (approvalMode === ApprovalMode.YOLO && !isAskUserQuestionTool) {
+          if (!needsConfirmation(finalPermission, approvalMode, reqInfo.name)) {
             this.setToolCallOutcome(
               reqInfo.callId,
               ToolConfirmationOutcome.ProceedAlways,
@@ -1053,10 +1053,12 @@ export class CoreToolScheduler {
             injectPermissionRulesIfMissing(confirmationDetails, pmCtx);
 
             if (
-              isPlanMode &&
-              !isExitPlanModeTool &&
-              !isAskUserQuestionTool &&
-              confirmationDetails.type !== 'info'
+              isPlanModeBlocked(
+                isPlanMode,
+                isExitPlanModeTool,
+                isAskUserQuestionTool,
+                confirmationDetails,
+              )
             ) {
               this.setStatusInternal(reqInfo.callId, 'error', {
                 callId: reqInfo.callId,
@@ -1073,11 +1075,7 @@ export class CoreToolScheduler {
             }
 
             // AUTO_EDIT mode: auto-approve edit-like and info tools
-            if (
-              approvalMode === ApprovalMode.AUTO_EDIT &&
-              (confirmationDetails.type === 'edit' ||
-                confirmationDetails.type === 'info')
-            ) {
+            if (isAutoEditApproved(approvalMode, confirmationDetails)) {
               this.setToolCallOutcome(
                 reqInfo.callId,
                 ToolConfirmationOutcome.ProceedAlways,
@@ -1907,22 +1905,17 @@ export class CoreToolScheduler {
     for (const pendingTool of pendingTools) {
       try {
         // Re-run L3→L4 to see if the tool can now be auto-approved
-        const defaultPermission =
-          await pendingTool.invocation.getDefaultPermission();
         const toolParams = pendingTool.invocation.params as Record<
           string,
           unknown
         >;
-        const pmCtx = buildPermissionCheckContext(
+        const flowResult = await evaluatePermissionFlow(
+          this.config,
+          pendingTool.invocation,
           pendingTool.request.name,
           toolParams,
-          this.config.getTargetDir?.() ?? '',
         );
-        const { finalPermission } = await evaluatePermissionRules(
-          this.config.getPermissionManager?.(),
-          defaultPermission,
-          pmCtx,
-        );
+        const { finalPermission } = flowResult;
 
         if (finalPermission === 'allow') {
           this.setToolCallOutcome(
