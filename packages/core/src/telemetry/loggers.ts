@@ -18,6 +18,9 @@ import type {
   ApiErrorEvent,
   ApiCancelEvent,
   ApiResponseEvent,
+  MemoryExtractEvent,
+  MemoryDreamEvent,
+  MemoryRecallEvent,
 } from './types.js';
 
 export function logStartSession(...args: any[]): void {}
@@ -97,9 +100,24 @@ export function logArenaSessionEnded(...args: any[]): void {}
 export function logHookCall(...args: any[]): void {}
 export function logPromptSuggestion(...args: any[]): void {}
 export function logSpeculation(...args: any[]): void {}
-export function logMemoryExtract(...args: any[]): void {}
-export function logMemoryDream(...args: any[]): void {}
-export function logMemoryRecall(...args: any[]): void {}
+export function logMemoryExtract(
+  config: Config | undefined,
+  event: MemoryExtractEvent,
+): void {
+  uiTelemetryService.addEvent(event as any);
+}
+export function logMemoryDream(
+  config: Config | undefined,
+  event: MemoryDreamEvent,
+): void {
+  uiTelemetryService.addEvent(event as any);
+}
+export function logMemoryRecall(
+  config: Config | undefined,
+  event: MemoryRecallEvent,
+): void {
+  uiTelemetryService.addEvent(event as any);
+}
 export function recordMemoryExtractMetrics(...args: any[]): void {}
 export function recordMemoryDreamMetrics(...args: any[]): void {}
 export function recordMemoryRecallMetrics(...args: any[]): void {}

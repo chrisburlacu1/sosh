@@ -36,6 +36,10 @@ const debugLogger = createDebugLogger('CONVERTER');
  */
 interface ExtendedCompletionUsage extends OpenAI.CompletionUsage {
   cached_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  reasoning_tokens?: number;
+  thinking_tokens?: number;
 }
 
 export interface ExtendedChatCompletionAssistantMessageParam
@@ -965,14 +969,18 @@ export function convertOpenAIResponseToGemini(
     const completionTokens = usage.completion_tokens || 0;
     const totalTokens = usage.total_tokens || 0;
     // Support both formats: prompt_tokens_details.cached_tokens (OpenAI standard)
-    // and cached_tokens (some models return it at top level)
+    // and alternative formats used by some providers (like DashScope)
     const extendedUsage = usage as ExtendedCompletionUsage;
     const cachedTokens =
       usage.prompt_tokens_details?.cached_tokens ??
       extendedUsage.cached_tokens ??
+      extendedUsage.cache_read_input_tokens ??
       0;
     const thinkingTokens =
-      usage.completion_tokens_details?.reasoning_tokens || 0;
+      usage.completion_tokens_details?.reasoning_tokens ??
+      extendedUsage.reasoning_tokens ??
+      extendedUsage.thinking_tokens ??
+      0;
 
     // If we only have total tokens but no breakdown, estimate the split
     // Typically input is ~70% and output is ~30% for most conversations
@@ -1139,14 +1147,18 @@ export function convertOpenAIChunkToGemini(
     const promptTokens = usage.prompt_tokens || 0;
     const completionTokens = usage.completion_tokens || 0;
     const totalTokens = usage.total_tokens || 0;
-    const thinkingTokens =
-      usage.completion_tokens_details?.reasoning_tokens || 0;
     // Support both formats: prompt_tokens_details.cached_tokens (OpenAI standard)
-    // and cached_tokens (some models return it at top level)
+    // and alternative formats used by some providers (like DashScope)
     const extendedUsage = usage as ExtendedCompletionUsage;
+    const thinkingTokens =
+      usage.completion_tokens_details?.reasoning_tokens ??
+      extendedUsage.reasoning_tokens ??
+      extendedUsage.thinking_tokens ??
+      0;
     const cachedTokens =
       usage.prompt_tokens_details?.cached_tokens ??
       extendedUsage.cached_tokens ??
+      extendedUsage.cache_read_input_tokens ??
       0;
 
     // If we only have total tokens but no breakdown, estimate the split
