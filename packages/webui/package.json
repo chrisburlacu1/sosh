@@ -1,7 +1,7 @@
 {
   "name": "@qwen-code/webui",
-  "version": "0.15.6",
-  "description": "Shared UI components for Qwen Code packages",
+  "version": "0.15.9",
+  "description": "Shared UI components for Sosh packages",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

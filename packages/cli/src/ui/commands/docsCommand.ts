@@ -30,7 +30,7 @@ export const docsCommand: SlashCommand = {
       return {
         type: 'message' as const,
         messageType: 'info' as const,
-        content: `Qwen Code documentation: ${docsUrl}`,
+        content: `Sosh documentation: ${docsUrl}`,
       };
     }
 

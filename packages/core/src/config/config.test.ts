@@ -15,6 +15,8 @@ import {
   DEFAULT_TELEMETRY_TARGET,
   DEFAULT_OTLP_ENDPOINT,
   QwenLogger,
+  isTelemetrySdkInitialized,
+  shutdownTelemetry,
 } from '../telemetry/index.js';
 import type {
   ContentGenerator,
@@ -150,7 +152,6 @@ vi.mock('../memory/const.js', () => ({
   getCurrentGeminiMdFilename: vi.fn(() => 'SOSH.md'), // Mock the original filename
   getAllGeminiMdFilenames: vi.fn(() => ['SOSH.md', 'AGENTS.md']),
   DEFAULT_CONTEXT_FILENAME: 'SOSH.md',
-  QWEN_CONFIG_DIR: '.qwen',
 }));
 vi.mock('../tools/memory-config', () => ({
   setGeminiMdFilename: vi.fn(),
@@ -158,7 +159,6 @@ vi.mock('../tools/memory-config', () => ({
   getAllGeminiMdFilenames: vi.fn(() => ['SOSH.md', 'AGENTS.md']),
   DEFAULT_CONTEXT_FILENAME: 'SOSH.md',
   AGENT_CONTEXT_FILENAME: 'AGENTS.md',
-  QWEN_CONFIG_DIR: '.qwen',
   MEMORY_SECTION_HEADER: '## Qwen Added Memories',
 }));
 
@@ -177,6 +177,8 @@ vi.mock('../telemetry/index.js', async (importOriginal) => {
   return {
     ...actual,
     initializeTelemetry: vi.fn(),
+    isTelemetrySdkInitialized: vi.fn(() => false),
+    shutdownTelemetry: vi.fn().mockResolvedValue(undefined),
     uiTelemetryService: {
       getLastPromptTokenCount: vi.fn(),
     },
@@ -210,6 +212,16 @@ vi.mock('../skills/skill-manager.js', () => {
   SkillManagerMock.prototype.listSkills = vi.fn().mockResolvedValue([]);
   SkillManagerMock.prototype.addChangeListener = vi.fn();
   SkillManagerMock.prototype.removeChangeListener = vi.fn();
+  // Path-conditional skill activation hook (called from
+  // CoreToolScheduler.executeSingleToolCall on every tool invocation).
+  // Mocks return empty so no activation-side effects fire in tests that
+  // exercise the scheduler.
+  SkillManagerMock.prototype.matchAndActivateByPath = vi
+    .fn()
+    .mockResolvedValue([]);
+  SkillManagerMock.prototype.matchAndActivateByPaths = vi
+    .fn()
+    .mockResolvedValue([]);
   return { SkillManager: SkillManagerMock };
 });
 
@@ -275,6 +287,7 @@ describe('Server Config (config.ts)', () => {
   beforeEach(() => {
     // Reset mocks if necessary
     vi.clearAllMocks();
+    vi.mocked(isTelemetrySdkInitialized).mockReturnValue(false);
     vi.spyOn(QwenLogger.prototype, 'logStartSessionEvent').mockImplementation(
       async () => undefined,
     );
@@ -908,6 +921,32 @@ describe('Server Config (config.ts)', () => {
     expect(config.getTelemetryEnabled()).toBe(true);
   });
 
+  it('Config shutdown should flush telemetry when SDK is initialized', async () => {
+    const paramsWithTelemetry: ConfigParameters = {
+      ...baseParams,
+      telemetry: { enabled: true },
+    };
+    vi.mocked(isTelemetrySdkInitialized).mockReturnValue(true);
+    const config = new Config(paramsWithTelemetry);
+
+    await config.shutdown();
+
+    expect(shutdownTelemetry).toHaveBeenCalledTimes(1);
+  });
+
+  it('Config shutdown should skip telemetry shutdown before SDK initialization', async () => {
+    const paramsWithTelemetry: ConfigParameters = {
+      ...baseParams,
+      telemetry: { enabled: true },
+    };
+    vi.mocked(isTelemetrySdkInitialized).mockReturnValue(false);
+    const config = new Config(paramsWithTelemetry);
+
+    await config.shutdown();
+
+    expect(shutdownTelemetry).not.toHaveBeenCalled();
+  });
+
   it('Config constructor should set telemetry to false when provided as false', () => {
     const paramsWithTelemetry: ConfigParameters = {
       ...baseParams,
@@ -983,6 +1022,95 @@ describe('Server Config (config.ts)', () => {
     });
   });
 
+  describe('GitCoAuthor Settings', () => {
+    it('defaults both commit and pr to true when not specified', () => {
+      const config = new Config({ ...baseParams, gitCoAuthor: undefined });
+      const settings = config.getGitCoAuthor();
+      expect(settings.commit).toBe(true);
+      expect(settings.pr).toBe(true);
+    });
+
+    it('accepts an object with independent commit and pr toggles', () => {
+      const config = new Config({
+        ...baseParams,
+        gitCoAuthor: { commit: true, pr: false },
+      });
+      const settings = config.getGitCoAuthor();
+      expect(settings.commit).toBe(true);
+      expect(settings.pr).toBe(false);
+    });
+
+    // Legacy shape: before commit and PR attribution were split, this
+    // setting was a single boolean. Treat it as governing both toggles so
+    // existing users' preferences carry over.
+    it.each([true, false])(
+      'coerces legacy boolean %s to { commit, pr } with the same value',
+      (value) => {
+        const config = new Config({ ...baseParams, gitCoAuthor: value });
+        const settings = config.getGitCoAuthor();
+        expect(settings.commit).toBe(value);
+        expect(settings.pr).toBe(value);
+      },
+    );
+
+    // settings.json is hand-editable; without intent-aware string
+    // parsing a hand-edited `{ commit: "false" }` would silently
+    // inflate to `commit: true` (the previous "default-to-true on
+    // mismatch" policy). Honor common string disable-intent forms
+    // and fall through to disabled on genuinely unrecognisable
+    // input — safer-by-default than turning attribution on against
+    // the user's clear opt-out.
+    it.each([
+      // Disable-intent strings.
+      ['string "false"', 'false', false],
+      ['string "FALSE"', 'FALSE', false],
+      ['string "no"', 'no', false],
+      ['string "off"', 'off', false],
+      ['string "0"', '0', false],
+      ['empty string', '', false],
+      // Enable-intent strings.
+      ['string "true"', 'true', true],
+      ['string "yes"', 'yes', true],
+      ['string "on"', 'on', true],
+      ['string "1"', '1', true],
+      // Numbers.
+      ['number 1', 1, true],
+      ['number 0', 0, false],
+      ['number 42', 42, false],
+      // Other types fall through to disabled.
+      ['null', null, false],
+      ['object', {}, false],
+      ['array', [], false],
+      // Unknown strings → disabled (don't quietly enable).
+      ['unknown string', 'maybe', false],
+    ])(
+      'parses %s as %s for both commit and pr',
+      (_label, badValue, expected) => {
+        const config = new Config({
+          ...baseParams,
+          gitCoAuthor: {
+            commit: badValue as unknown as boolean,
+            pr: badValue as unknown as boolean,
+          },
+        });
+        const settings = config.getGitCoAuthor();
+        expect(settings.commit).toBe(expected);
+        expect(settings.pr).toBe(expected);
+      },
+    );
+
+    // A genuinely-absent sub-field still defaults to true (schema default).
+    it('defaults absent commit/pr to true', () => {
+      const config = new Config({
+        ...baseParams,
+        gitCoAuthor: {} as { commit?: boolean; pr?: boolean },
+      });
+      const settings = config.getGitCoAuthor();
+      expect(settings.commit).toBe(true);
+      expect(settings.pr).toBe(true);
+    });
+  });
+
   describe('Telemetry Settings', () => {
     it('should return default telemetry target if not provided', () => {
       const params: ConfigParameters = {
@@ -1037,6 +1165,32 @@ describe('Server Config (config.ts)', () => {
       expect(config.getTelemetryLogPromptsEnabled()).toBe(true);
     });
 
+    it('should return provided includeSensitiveSpanAttributes setting', () => {
+      const params: ConfigParameters = {
+        ...baseParams,
+        telemetry: { enabled: true, includeSensitiveSpanAttributes: true },
+      };
+      const config = new Config(params);
+      expect(config.getTelemetryIncludeSensitiveSpanAttributes()).toBe(true);
+    });
+
+    it('should default includeSensitiveSpanAttributes to false', () => {
+      const configWithTelemetry = new Config({
+        ...baseParams,
+        telemetry: { enabled: true },
+      });
+      expect(
+        configWithTelemetry.getTelemetryIncludeSensitiveSpanAttributes(),
+      ).toBe(false);
+
+      const paramsWithoutTelemetry: ConfigParameters = { ...baseParams };
+      delete paramsWithoutTelemetry.telemetry;
+      const configWithoutTelemetry = new Config(paramsWithoutTelemetry);
+      expect(
+        configWithoutTelemetry.getTelemetryIncludeSensitiveSpanAttributes(),
+      ).toBe(false);
+    });
+
     it('should return default telemetry target if telemetry object is not provided', () => {
       const paramsWithoutTelemetry: ConfigParameters = { ...baseParams };
       delete paramsWithoutTelemetry.telemetry;
@@ -1074,6 +1228,41 @@ describe('Server Config (config.ts)', () => {
       delete paramsWithoutTelemetry.telemetry;
       const config = new Config(paramsWithoutTelemetry);
       expect(config.getTelemetryOtlpProtocol()).toBe('grpc');
+    });
+  });
+
+  describe('Per-Signal OTLP Endpoint Configuration', () => {
+    it('should return per-signal endpoints when provided', () => {
+      const params: ConfigParameters = {
+        ...baseParams,
+        telemetry: {
+          enabled: true,
+          otlpTracesEndpoint: 'http://traces:4318/v1/traces',
+          otlpLogsEndpoint: 'http://logs:4318/v1/logs',
+          otlpMetricsEndpoint: 'http://metrics:4318/v1/metrics',
+        },
+      };
+      const config = new Config(params);
+      expect(config.getTelemetryOtlpTracesEndpoint()).toBe(
+        'http://traces:4318/v1/traces',
+      );
+      expect(config.getTelemetryOtlpLogsEndpoint()).toBe(
+        'http://logs:4318/v1/logs',
+      );
+      expect(config.getTelemetryOtlpMetricsEndpoint()).toBe(
+        'http://metrics:4318/v1/metrics',
+      );
+    });
+
+    it('should return undefined when per-signal endpoints are not provided', () => {
+      const params: ConfigParameters = {
+        ...baseParams,
+        telemetry: { enabled: true },
+      };
+      const config = new Config(params);
+      expect(config.getTelemetryOtlpTracesEndpoint()).toBeUndefined();
+      expect(config.getTelemetryOtlpLogsEndpoint()).toBeUndefined();
+      expect(config.getTelemetryOtlpMetricsEndpoint()).toBeUndefined();
     });
   });
 
@@ -1998,6 +2187,104 @@ describe('Model Switching and Config Updates', () => {
 
       expect(config.hasHooksForEvent('Stop')).toBe(false);
       expect(mockHasHooksForEvent).toHaveBeenCalledWith('Stop');
+    });
+  });
+
+  describe('runtime ContentGenerator view (AsyncLocalStorage)', () => {
+    // The Config getters consult the per-run ALS view published by the
+    // agent runtime when a sub-agent runs on a different model than the
+    // parent. These tests pin that integration: tools that captured the
+    // parent Config at construction must still resolve to the agent's
+    // values when called inside the agent's runtime frame.
+    function setInstanceFields(
+      config: Config,
+      contentGenerator: ContentGenerator,
+      generatorConfig: ContentGeneratorConfig,
+    ): void {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (config as any).contentGenerator = contentGenerator;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (config as any).contentGeneratorConfig = generatorConfig;
+    }
+
+    it('resolves getters to the runtime view inside the frame, instance fields outside', async () => {
+      const { runWithRuntimeContentGenerator } = await import(
+        '../agents/runtime/agent-context.js'
+      );
+      const config = new Config(baseParams);
+      const parentGenerator = {
+        generateContentStream: vi.fn(),
+      } as unknown as ContentGenerator;
+      const parentGeneratorConfig: ContentGeneratorConfig = {
+        model: 'parent-model',
+        authType: AuthType.QWEN_OAUTH,
+        apiKey: 'parent-key',
+      };
+      setInstanceFields(config, parentGenerator, parentGeneratorConfig);
+
+      const agentGenerator = {
+        generateContentStream: vi.fn(),
+      } as unknown as ContentGenerator;
+      const agentGeneratorConfig: ContentGeneratorConfig = {
+        model: 'agent-model',
+        authType: AuthType.USE_OPENAI,
+        apiKey: 'agent-key',
+      };
+
+      // Outside the frame, getters resolve to the parent's instance fields.
+      expect(config.getContentGenerator()).toBe(parentGenerator);
+      expect(config.getContentGeneratorConfig()).toBe(parentGeneratorConfig);
+      expect(config.getModel()).toBe('parent-model');
+      expect(config.getAuthType()).toBe(AuthType.QWEN_OAUTH);
+
+      // Inside the frame, every getter resolves to the agent's view.
+      await runWithRuntimeContentGenerator(
+        {
+          contentGenerator: agentGenerator,
+          contentGeneratorConfig: agentGeneratorConfig,
+        },
+        async () => {
+          expect(config.getContentGenerator()).toBe(agentGenerator);
+          expect(config.getContentGeneratorConfig()).toBe(agentGeneratorConfig);
+          expect(config.getModel()).toBe('agent-model');
+          expect(config.getAuthType()).toBe(AuthType.USE_OPENAI);
+        },
+      );
+
+      // Frame exit restores resolution to the parent's instance fields.
+      expect(config.getContentGenerator()).toBe(parentGenerator);
+      expect(config.getModel()).toBe('parent-model');
+    });
+
+    it('falls back to the parent model id when the runtime view config has no model', async () => {
+      const { runWithRuntimeContentGenerator } = await import(
+        '../agents/runtime/agent-context.js'
+      );
+      const config = new Config(baseParams);
+      setInstanceFields(
+        config,
+        { generateContentStream: vi.fn() } as unknown as ContentGenerator,
+        {
+          model: 'parent-model',
+          authType: AuthType.QWEN_OAUTH,
+        } as ContentGeneratorConfig,
+      );
+
+      await runWithRuntimeContentGenerator(
+        {
+          contentGenerator: {
+            generateContentStream: vi.fn(),
+          } as unknown as ContentGenerator,
+          contentGeneratorConfig: {
+            model: '',
+            authType: AuthType.USE_OPENAI,
+          } as ContentGeneratorConfig,
+        },
+        async () => {
+          // Empty model on the runtime view falls through to modelsConfig.
+          expect(config.getModel()).toBe(baseParams.model);
+        },
+      );
     });
   });
 });

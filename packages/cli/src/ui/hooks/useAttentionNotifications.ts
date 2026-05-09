@@ -18,7 +18,7 @@ import { sendNotification } from '../../services/notificationService.js';
 
 export const LONG_TASK_NOTIFICATION_THRESHOLD_SECONDS = 20;
 
-const NOTIFICATION_TITLE = 'Qwen Code';
+const NOTIFICATION_TITLE = 'Sosh';
 
 interface UseAttentionNotificationsOptions {
   isFocused: boolean;
@@ -63,8 +63,8 @@ export const useAttentionNotifications = ({
       terminalBellEnabled
     ) {
       const message = awaitingToolName
-        ? `Qwen Code needs your permission to use ${awaitingToolName}`
-        : 'Qwen Code is waiting for your input';
+        ? `Sosh needs your permission to use ${awaitingToolName}`
+        : 'Sosh is waiting for your input';
 
       sendNotification(
         { message, title: NOTIFICATION_TITLE },
@@ -99,7 +99,7 @@ export const useAttentionNotifications = ({
       if (wasLongTask && !isFocused && terminalBellEnabled) {
         sendNotification(
           {
-            message: 'Qwen Code is waiting for your input',
+            message: 'Sosh is waiting for your input',
             title: NOTIFICATION_TITLE,
           },
           terminal,

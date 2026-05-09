@@ -1,6 +1,6 @@
 # @qwen-code/webui
 
-A shared React component library for Qwen Code applications, providing cross-platform UI components with consistent styling and behavior.
+A shared React component library for Sosh applications, providing cross-platform UI components with consistent styling and behavior.
 
 ## Features
 

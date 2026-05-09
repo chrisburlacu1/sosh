@@ -30,6 +30,7 @@ import {
   NativeLspService,
   isBareMode,
   isToolEnabled,
+  type ConfigParameters,
   type MCPServerConfig,
 } from '@qwen-code/qwen-code-core';
 import { extensionsCommand } from '../commands/extensions.js';
@@ -54,6 +55,7 @@ import { loadSandboxConfig } from './sandboxConfig.js';
 import { appEvents } from '../utils/events.js';
 import { mcpCommand } from '../commands/mcp.js';
 import { channelCommand } from '../commands/channel.js';
+import { reviewCommand } from '../commands/review.js';
 
 // UUID v4 regex pattern for validation
 const SESSION_ID_REGEX =
@@ -196,7 +198,7 @@ export async function parseArguments(): Promise<CliArgs> {
 
   const yargsInstance = yargs(rawArgv)
     .locale('en')
-    .scriptName('qwen')
+    .scriptName('sosh')
     .usage(
       'Usage: sosh [options] [command]\n\nSosh - Launch an interactive CLI, use -p/--prompt for non-interactive mode',
     )
@@ -614,7 +616,9 @@ export async function parseArguments(): Promise<CliArgs> {
     // Register Hooks subcommands
     .command(hooksCommand)
     // Register Channel subcommands
-    .command(channelCommand);
+    .command(channelCommand)
+    // Register /review skill helpers (presubmit checks, cleanup)
+    .command(reviewCommand);
 
   yargsInstance
     .version(await getCliVersion()) // This will enable the --version flag based on package.json
@@ -636,9 +640,13 @@ export async function parseArguments(): Promise<CliArgs> {
     (result._[0] === 'mcp' ||
       result._[0] === 'extensions' ||
       result._[0] === 'hooks' ||
-      result._[0] === 'channel')
+      result._[0] === 'channel' ||
+      result._[0] === 'review')
   ) {
-    // MCP/Extensions/Hooks commands handle their own execution and process exit
+    // MCP/Extensions/Hooks/Channel/Review commands handle their own
+    // execution and exit. Returning here would let the main interactive
+    // flow run, which would prompt for stdin input despite the user
+    // having already invoked a subcommand.
     process.exit(0);
   }
 
@@ -1028,16 +1036,8 @@ export async function loadCliConfig(
   // to preserve the original behaviour where "ShellTool", "Shell", and
   // "run_shell_command" are all accepted as the same tool.
   const isExplicitlyAllowed = (toolName: ToolName): boolean => {
-    const name = toolName as string;
     // 1. Check permissions.allow / allowedTools rules.
-    if (
-      mergedAllow.some((rule) => {
-        const openParen = rule.indexOf('(');
-        const ruleName =
-          openParen === -1 ? rule.trim() : rule.substring(0, openParen).trim();
-        return ruleName === name;
-      })
-    ) {
+    if (mergedAllow.some((rule) => isToolEnabled(toolName, [rule], []))) {
       return true;
     }
     // 2. Check coreTools whitelist (with alias matching).
@@ -1071,12 +1071,14 @@ export async function loadCliConfig(
       case ApprovalMode.DEFAULT:
         // Deny all write/execute tools unless explicitly allowed.
         denyUnlessAllowed(ToolNames.SHELL as ToolName);
+        denyUnlessAllowed(ToolNames.MONITOR as ToolName);
         denyUnlessAllowed(ToolNames.EDIT as ToolName);
         denyUnlessAllowed(ToolNames.WRITE_FILE as ToolName);
         break;
       case ApprovalMode.AUTO_EDIT:
-        // Only shell requires a prompt in auto-edit mode.
+        // Shell-like execute tools still require a prompt in auto-edit mode.
         denyUnlessAllowed(ToolNames.SHELL as ToolName);
+        denyUnlessAllowed(ToolNames.MONITOR as ToolName);
         break;
       case ApprovalMode.YOLO:
         // No extra denials for YOLO mode.
@@ -1150,7 +1152,7 @@ export async function loadCliConfig(
       sessionId = argv.resume;
       sessionData = await sessionService.loadSession(argv.resume);
       if (!sessionData) {
-        const message = `No saved session found with ID ${argv.resume}. Run \`qwen --resume\` without an ID to choose from existing sessions.`;
+        const message = `No saved session found with ID ${argv.resume}. Run \`sosh --resume\` without an ID to choose from existing sessions.`;
         writeStderrLine(message);
         process.exit(1);
       }
@@ -1170,7 +1172,7 @@ export async function loadCliConfig(
 
   const modelProvidersConfig = settings.modelProviders;
 
-  const config = new Config({
+  const configParams: ConfigParameters = {
     sessionId,
     sessionData,
     embeddingModel: DEFAULT_QWEN_EMBEDDING_MODEL,
@@ -1300,6 +1302,9 @@ export async function loadCliConfig(
       ? false
       : (settings.memory?.enableManagedAutoMemory ?? true),
     enableManagedAutoDream: settings.memory?.enableManagedAutoDream ?? false,
+    enableAutoSkill: bareMode
+      ? false
+      : (settings.memory?.enableAutoSkill ?? false),
     fastModel: settings.fastModel || undefined,
     // Use separated hooks if provided, otherwise fall back to merged hooks
     userHooks: bareMode
@@ -1337,7 +1342,9 @@ export async function loadCliConfig(
             : undefined,
         }
       : undefined,
-  });
+  };
+
+  const config = new Config(configParams);
 
   if (lspEnabled) {
     try {

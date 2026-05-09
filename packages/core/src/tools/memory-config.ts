@@ -10,10 +10,9 @@
  * when only the filename configuration is needed.
  */
 
-export const QWEN_CONFIG_DIR = '.qwen';
-export const DEFAULT_CONTEXT_FILENAME = 'SOSH.md';
+export const DEFAULT_CONTEXT_FILENAME = 'Sosh.md';
 export const AGENT_CONTEXT_FILENAME = 'AGENTS.md';
-export const MEMORY_SECTION_HEADER = '## Qwen Added Memories';
+export const MEMORY_SECTION_HEADER = '## Sosh Added Memories';
 
 // This variable will hold the currently configured filename for context files.
 // It defaults to include both SOSH.md and AGENTS.md but can be overridden by setGeminiMdFilename.
