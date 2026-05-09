@@ -10,7 +10,7 @@
  * when only the filename configuration is needed.
  */
 
-export const DEFAULT_CONTEXT_FILENAME = 'Sosh.md';
+export const DEFAULT_CONTEXT_FILENAME = 'SOSH.md';
 export const AGENT_CONTEXT_FILENAME = 'AGENTS.md';
 export const MEMORY_SECTION_HEADER = '## Sosh Added Memories';
 
